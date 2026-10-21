@@ -322,6 +322,86 @@ def bake_texture_type(m2: bytes, tex_type: int, fdid: int) -> tuple[bytes, int]:
     return bytes(out), baked
 
 
+PARTICLE_STRIDE = 0x1EC            # a modern (272-274) particle emitter record
+PARTICLE_MULTITEX = 0x10000000     # emitter flag: the texture slot packs three layer ids (5 bits each)
+
+
+def _texture_users(md20: bytes) -> dict[int, set]:
+    """Which parts of the model use each texture: 'batch' (texture lookup), 'ribbon', or an emitter
+    key (its packed texture slot)."""
+    users: dict[int, set] = {}
+    n, off = struct.unpack_from("<II", md20, 0x80)
+    for k in range(n):
+        users.setdefault(struct.unpack_from("<H", md20, off + 2 * k)[0], set()).add("batch")
+    n, off = struct.unpack_from("<II", md20, 0x120)
+    for k in range(n):
+        # ribbon: textureIndices M2Array at 0x14
+        tn, to = struct.unpack_from("<II", md20, off + 0xB0 * k + 0x14)
+        for j in range(min(tn, 8)):
+            if to + 2 * j + 2 <= len(md20):
+                users.setdefault(struct.unpack_from("<H", md20, to + 2 * j)[0], set()).add("ribbon")
+    n, off = struct.unpack_from("<II", md20, 0x128)
+    for k in range(n):
+        r = off + PARTICLE_STRIDE * k
+        flags = struct.unpack_from("<I", md20, r + 4)[0]
+        slot = struct.unpack_from("<H", md20, r + 0x16)[0]
+        if flags & PARTICLE_MULTITEX:
+            users.setdefault(slot & 0x1F, set()).add(("multi", slot))
+        else:
+            users.setdefault(slot, set()).add("single")
+    return users
+
+
+def bake_multitex_particles(m2: bytes, files: dict[str, bytes], tex_file: dict[int, str]) -> list[str]:
+    """The 3.3.5 client draws one texture per particle; a modern multi-texture emitter multiplies its
+    first layer (often a white shape mask) by two more (e.g. dark scrolling clouds). Bake those two into
+    the first layer's file, per flipbook cell, where nothing else in the model uses that texture.
+    The layers' scrolling is lost. ``tex_file``: texture index -> path in ``files``. Returns notes."""
+    from PIL import Image, ImageChops
+    from ..formats import blp
+    md20 = _chunks(m2).get("MD21", b"")
+    if len(md20) < 0x130:
+        return []
+    notes = []
+    for tex, who in _texture_users(md20).items():
+        slots = {u[1] for u in who if isinstance(u, tuple)}
+        if not slots or len(slots) != len(who) or len(slots) > 1:
+            continue                       # not a multi-texture mask, or shared with other uses
+        slot = slots.pop()
+        layers = [(slot >> 5) & 0x1F, (slot >> 10) & 0x1F]
+        path = tex_file.get(tex)
+        if not path or path not in files or any(l == tex or l not in tex_file or tex_file[l] not in files
+                                                for l in layers):
+            continue
+        # the emitter's flipbook grid: the layers cover each cell, not the whole sheet
+        n, off = struct.unpack_from("<II", md20, 0x128)
+        rows = cols = 1
+        for k in range(n):
+            r = off + PARTICLE_STRIDE * k
+            if struct.unpack_from("<H", md20, r + 0x16)[0] == slot:
+                rows, cols = max(1, struct.unpack_from("<H", md20, r + 0x30)[0]), \
+                             max(1, struct.unpack_from("<H", md20, r + 0x32)[0])
+                break
+        try:
+            base = blp.decode_bytes(files[path]).convert("RGBA")
+            cw, ch = max(1, base.width // cols), max(1, base.height // rows)
+            rgb = base.convert("RGB")
+            for l in layers:
+                cell = blp.decode_bytes(files[tex_file[l]]).convert("RGB").resize((cw, ch), Image.LANCZOS)
+                sheet = Image.new("RGB", base.size)
+                for y in range(0, base.height, ch):
+                    for x in range(0, base.width, cw):
+                        sheet.paste(cell, (x, y))
+                # each layer modulates at 2x, as the client's own two-texture combiners do
+                rgb = ImageChops.multiply(rgb, sheet).point(lambda v: min(255, v * 2))
+            baked = Image.merge("RGBA", (*rgb.split(), base.getchannel("A")))
+            files[path] = blp.encode_dxt(baked, alpha=True)
+            notes.append(f"particle texture {tex}: layers {layers[0]} and {layers[1]} baked in (they no longer scroll)")
+        except Exception as e:  # a texture this can't decode keeps its first layer only
+            notes.append(f"particle texture {tex}: layers not baked ({e})")
+    return notes
+
+
 class Export:
     """A display's files, as the client and the mod will look for them."""
 
@@ -442,6 +522,9 @@ def export_display(read, row: dict, stem: str) -> Export:
     for k, fdid in enumerate(row_textures(row)):
         if fdid:
             ex.variations[k] = texture(fdid)
+    tex_file = {i: f"{ex.folder}\\{names[f]}.blp" for i, f in enumerate(_u32s(ch.get("TXID", b"")))
+                if f and names.get(f)}
+    ex.notes += bake_multitex_particles(m2, ex.files, tex_file)
     fourth = row_fourth_texture(row)
     if fourth and texture(fourth):
         m2, baked = bake_texture_type(m2, FOURTH_SKIN_TYPE, fourth)
