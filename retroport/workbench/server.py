@@ -148,8 +148,8 @@ class Settings:
         """Why a source can't be read ("" when it can)."""
         if spec.kind != "local":
             return ""
-        if not spec.path or not os.path.isfile(os.path.join(spec.path, ".build.info")):
-            return f"{spec.label}: {spec.path or '(no folder)'} is not a game install (no .build.info)"
+        if not spec.path or not _is_install(spec.path):
+            return f"{spec.label}: {spec.path or '(no folder)'} is not a game install (no .build.info, no Data\\config)"
         if not self.dbd or not os.path.isdir(self.dbd):
             return f"{spec.label}: a local install needs the WoWDBDefs definitions folder"
         if not self.listfile or not os.path.isfile(self.listfile):
@@ -852,7 +852,7 @@ class Workbench:
             if sp.kind == "local":
                 why = st.source_problem(sp)
                 build = ""
-                if os.path.isfile(os.path.join(sp.path or "", ".build.info")):
+                if _is_install(sp.path or ""):
                     try:
                         from pathlib import Path
                         from wotlkconv.casc.config import BuildInfo
@@ -939,6 +939,11 @@ class Workbench:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(entries, fh, indent=1)
         os.replace(tmp, self.basket_path)
+
+
+def _is_install(path: str) -> bool:
+    """A local game install: .build.info, or (a repacked client) its build configs in Data\\config."""
+    return os.path.isfile(os.path.join(path, ".build.info")) or os.path.isdir(os.path.join(path, "Data", "config"))
 
 
 def _int(v: str | None) -> int | None:

@@ -78,10 +78,14 @@ class BuildInfo:
         """Read ``.build.info`` and the build config it points at."""
         info_path = install_dir / ".build.info"
         if not info_path.is_file():
+            found = cls.from_configs(install_dir)
+            if found is not None:
+                return found
             raise MissingDependencyError(
                 f"{install_dir} does not look like a game install: no "
-                f".build.info. Point --casc at the folder containing the "
-                f"game executable and its Data directory"
+                f".build.info and no build config under Data/config. Point "
+                f"--casc at the folder containing the game executable and its "
+                f"Data directory"
             )
         rows = parse_build_info(info_path.read_text(encoding="utf-8",
                                                     errors="replace"))
@@ -117,7 +121,44 @@ class BuildInfo:
                 f"build config {info.build_key} is missing from {cfg_path}; "
                 f"the install may be mid-update or partially repaired")
         cfg = parse_config(cfg_path.read_text(encoding="utf-8", errors="replace"))
+        return info._fill(cfg)
 
+    @classmethod
+    def from_configs(cls, install_dir: Path) -> BuildInfo | None:
+        """An install without ``.build.info`` (a repacked client: Wow.exe and Data alone): its
+        build config is the file under ``Data/config`` naming a root and an encoding file (the
+        newest, if several), its CDN config the one naming archives."""
+        root = install_dir / "Data" / "config"
+        if not root.is_dir():
+            return None
+        builds, cdns = [], []
+        for path in root.glob("*/*/*"):
+            if not path.is_file() or path.stat().st_size > 1_000_000:
+                continue
+            try:
+                cfg = parse_config(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            if cfg.get("root") and cfg.get("encoding"):
+                builds.append((path.stat().st_mtime, path.name, cfg))
+            elif cfg.get("archives"):
+                cdns.append((path.stat().st_mtime, path.name))
+        if not builds:
+            return None
+        _t, key, cfg = max(builds)
+        name = " ".join(cfg.get("build-name", []))
+        version = ""
+        import re
+        m = re.search(r"WOW-(\d+)patch(\d+(?:\.\d+)*)", name)
+        if m:
+            version = f"{m.group(2)}.{m.group(1)}"
+        product = (cfg.get("build-product") or ["wow"])[0].lower()
+        info = cls(product=product, version=version, build_key=key, cdn_key=max(cdns)[1] if cdns else "")
+        return info._fill(cfg)
+
+    def _fill(self, cfg: dict[str, list[str]]) -> BuildInfo:
+        """The root, encoding and install files a build config names."""
+        info = self
         root = cfg.get("root", [])
         encoding = cfg.get("encoding", [])
         install = cfg.get("install", [])

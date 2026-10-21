@@ -161,8 +161,10 @@ class Source:
                 return self._casc
             from wotlkconv.casc import CascStorage
             from wotlkconv.db.dbd import DbdIndex
-            if not os.path.isfile(os.path.join(self.spec.path, ".build.info")):
-                raise SourceError(f"{self.spec.label}: {self.spec.path} is not a game install (no .build.info)")
+            if not os.path.isfile(os.path.join(self.spec.path, ".build.info")) and \
+                    not os.path.isdir(os.path.join(self.spec.path, "Data", "config")):
+                raise SourceError(f"{self.spec.label}: {self.spec.path} is not a game install "
+                                  "(no .build.info, no Data\\config)")
             cdn = os.path.join(self.cache_dir, "cdn") if self.spec.cdn else None
             casc = CascStorage.open(self.spec.path, product=self.spec.product, cdn_cache=cdn)
             self._defs = DbdIndex(self.dbd_dir)
