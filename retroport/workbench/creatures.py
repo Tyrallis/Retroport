@@ -40,6 +40,7 @@ import time
 from .. import dbc as D
 from ..mpq import ClientData, write_archive
 from . import models as M
+from .procs import Restart
 from .wago import http_get
 
 PATCH_NAME = "patch-R.MPQ"
@@ -625,6 +626,7 @@ class Creatures:
         mysql = find_mysql(s.get("mysql", ""))
         return {"world_conf": conf, "world_conf_set": s.get("world_conf", ""), "mysql": mysql,
                 "mysql_set": s.get("mysql", ""), "run_sql": s.get("run_sql", True),
+                "restart": s.get("restart", False),
                 "database": (f"{db['user']}@{db['host']}:{db['port']}/{db['database']}" if db else ""),
                 "client": self.wb.settings.client, "server_dbc": getattr(kit, "server_dbc", "") or "",
                 "modern_m2": self.modern_m2_state()}
@@ -634,8 +636,9 @@ class Creatures:
         for k in ("world_conf", "mysql"):
             if k in v:
                 s[k] = (v[k] or "").strip().strip('"')
-        if "run_sql" in v:
-            s["run_sql"] = bool(v["run_sql"])
+        for k in ("run_sql", "restart"):
+            if k in v:
+                s[k] = bool(v[k])
         self._save("settings.json", s)
         return self.settings()
 
@@ -754,16 +757,28 @@ class Creatures:
         return self.job_view(0)
 
     def _install_guarded(self) -> None:
+        self._restart = None
         try:
-            self.job["result"] = self.install()
-            self.job["state"] = "done"
+            result = self.install()
         except Exception as e:
             self._say(f"stopped: {type(e).__name__}: {e}")
             for s in self.job["steps"]:
                 if s["state"] == "running":
                     s["state"] = "failed"
-            self.job["result"] = {"ok": False, "error": f"{e}"}
-            self.job["state"] = "failed"
+            result = {"ok": False, "error": f"{e}"}
+        # what Install closed is started again, also when the install stopped half-way
+        if self._restart is not None:
+            name = "Start the worldserver and client"
+            self._step(name, "running")
+            try:
+                result["restarted"] = self._restart.start_all()
+                self._step(name, "done")
+            except Exception as e:
+                self._say(f"could not start them again: {e}")
+                self._step(name, "failed")
+            self._restart = None
+        self.job["result"] = result
+        self.job["state"] = "done" if result.get("ok") else "failed"
 
     def install_list(self) -> list:
         """What the game will hold: what's in it, minus what's taken out, then the basket."""
@@ -876,6 +891,14 @@ class Creatures:
         self._save("retired.json", sorted(retired - current))
         self._step("Number the creatures", "done")
 
+        # the client holds the patch open and the worldserver reads its tables at start: close both
+        # now, after the slow export, and start them when Install is done (_install_guarded)
+        if st["restart"]:
+            self._step("Close the client and worldserver", "running")
+            self._restart = Restart(client, st["world_conf"], self._say)
+            self._restart.stop()
+            self._step("Close the client and worldserver", "done")
+
         # 3. client patch
         self._step(f"Build Data\\{PATCH_NAME}", "running")
         md, di = base_md, base_di
@@ -969,7 +992,8 @@ class Creatures:
                   "creatures": [{"display": int(e["display"]), "name": e["name"], **ids[str(e["display"])],
                                  "notes": notes.get(int(e["display"]), [])} for e in now],
                   "restart": bool(sbase) or ran}
-        self._say("done: restart the worldserver, start the client, and .npc add <entry> in game")
+        self._say("done: .npc add <entry> in game" if st["restart"] else
+                  "done: restart the worldserver, start the client, and .npc add <entry> in game")
         return result
 
     def _creature(self, did: int, wanted: list, row: dict) -> dict:

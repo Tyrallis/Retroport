@@ -167,6 +167,8 @@ function crRenderBasket() {
       el("button", {class: "remove", title: "Remove from the basket", onclick: async () => {
         st.basket = st.basket.filter(x => x !== e); await crSaveBasket(); }}, "×"));
   });
+  // the basket panel is narrow while empty and grows with its rows (style.css .cr-top.full)
+  $(".cr-top").classList.toggle("full", rows.length > 0);
   $("#cr-basket").replaceChildren(
     el("h3", {}, `Creature basket · ${plural(st.basket.length, "creature")}`),
     rows.length ? el("div", {class: "cr-rows"}, rows) : el("p", {class: "muted small"}, "Add creatures with + : Install puts them in your client and on your server."));
@@ -181,11 +183,15 @@ function crRenderBasket() {
   const conf = el("input", {type: "text", value: s.world_conf_set || "", placeholder: s.world_conf || "worldserver.conf"});
   const mysql = el("input", {type: "text", value: s.mysql_set || "", placeholder: s.mysql || "mysql.exe"});
   const run = el("input", {type: "checkbox", checked: s.run_sql !== false});
+  const restart = el("input", {type: "checkbox", checked: !!s.restart});
   const saveSt = async () => {
-    try { st.settings = await post("/api/creatures/settings", {world_conf: conf.value, mysql: mysql.value, run_sql: run.checked}); crRenderBasket(); }
-    catch (err) { toast(err.message); }
+    try {
+      st.settings = await post("/api/creatures/settings",
+        {world_conf: conf.value, mysql: mysql.value, run_sql: run.checked, restart: restart.checked});
+      crRenderBasket();
+    } catch (err) { toast(err.message); }
   };
-  conf.addEventListener("change", saveSt); mysql.addEventListener("change", saveSt); run.addEventListener("change", saveSt);
+  [conf, mysql, run, restart].forEach(i => i.addEventListener("change", saveSt));
   const ok = s.modern_m2 === "installed";
   $("#cr-game").replaceChildren(...[
     el("h3", {}, `In your game · ${plural(st.installed.length, "creature")}`),
@@ -197,6 +203,9 @@ function crRenderBasket() {
     el("div", {class: "small"}, `World database: ${s.database || "not found"}${s.world_conf ? ` (from ${s.world_conf})` : ""}`),
     el("div", {class: "form cr-db"},
       el("label", {class: "check"}, run, " Run the SQL on the world database (else it is saved for you to apply)"),
+      el("label", {class: "check", title: "The client is closed and the worldserver shut down (it saves the players) " +
+        "right before the patch is written, and both are started again when the install is done"},
+        restart, " Restart the worldserver and client when the install is done"),
       crField("worldserver.conf (empty: found next to the server dbc folder)", conf),
       crField("MySQL client (empty: found on this computer)", mysql)));
 }
@@ -209,13 +218,15 @@ function crRenderJob(j) {
     s.state === "done" ? "✓ " : s.state === "failed" ? "✗ " : "… ", s.name)));
   const r = j.result;
   if (!r) { $("#cr-result").replaceChildren(); return; }
-  if (!r.ok) { $("#cr-result").replaceChildren(el("div", {class: "warnline"}, `Install stopped: ${r.error}`)); return; }
+  const again = r.restarted && r.restarted.length ? `Started again: ${r.restarted.join(" and ")}.` : "";
+  if (!r.ok) { $("#cr-result").replaceChildren(el("div", {class: "warnline"}, `Install stopped: ${r.error} ${again}`)); return; }
   $("#cr-result").replaceChildren(...[
     el("div", {class: "okline"}, `Installed ${plural(r.creatures.length, "creature")}.` +
       (r.sql_ran ? " The world database has them." : " Apply the SQL to your world database:")),
     r.sql_ran ? null : el("div", {class: "small"}, el("code", {}, `SOURCE ${r.sql.replace(/\\/g, "/")};`),
                           el("button", {class: "copy", onclick: () => copy(`SOURCE ${r.sql.replace(/\\/g, "/")};`)}, "copy")),
-    el("p", {class: "small"}, "Restart the worldserver (it reads the creature tables at start), start the client, and spawn one:"),
+    el("p", {class: "small"}, again ? `${again} Once you're in the world, spawn one:` :
+      "Restart the worldserver (it reads the creature tables at start), start the client, and spawn one:"),
     el("div", {class: "cr-npc"}, r.creatures.map(c => el("div", {},
       el("button", {class: "copy", onclick: () => copy(`.npc add ${c.entry}`)}, `.npc add ${c.entry}`), ` ${c.name} `,
       el("span", {class: "muted small"}, `display ${c.display} · model ${c.model}`),
