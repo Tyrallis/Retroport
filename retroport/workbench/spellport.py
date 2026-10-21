@@ -42,6 +42,7 @@ ROOT = "Spells\\Retroport"
 FLOOR = 60000                       # new SpellVisual / Kit / EffectName ids start here (and above the client's)
 NO_ANIM = 0xFFFFFFFF
 MAX_ANIM = 505                      # the last animation id the 3.3.5 client plays
+MAX_ATTACHMENT = 52                 # the last M2 attachment point 3.3.5's models know
 
 SPELL_FIELDS, SPELL_VISUAL, SPELL_NAME = 234, 131, 136
 VISUAL_FIELDS, KIT_FIELDS, NAME_FIELDS = 32, 38, 7
@@ -319,8 +320,11 @@ class SpellPort:
                 if eid:
                     vrow[V["HasMissile"]] = 1
                     vrow[V["MissileModel"]] = eid
-                    vrow[V["MissileAttachment"]] = m["attachment"] & 0xFFFFFFFF
-                    vrow[V["MissileDestinationAttachment"]] = max(0, m["destination"])
+                    # retail's newer points (56: a directed spell hand) are missing from 3.3.5 bodies:
+                    # the client's own default (-1: the casting hand) and the chest (15) instead
+                    att, dest = m["attachment"], m["destination"]
+                    vrow[V["MissileAttachment"]] = (att if 0 <= att <= MAX_ATTACHMENT else -1) & 0xFFFFFFFF
+                    vrow[V["MissileDestinationAttachment"]] = dest if 0 <= dest <= MAX_ATTACHMENT else 15
                     for k in range(3):
                         vrow[V["MissileCastOffset"] + k] = _f(m["cast_offset"][k])
                         vrow[V["MissileImpactOffset"] + k] = _f(m["impact_offset"][k])

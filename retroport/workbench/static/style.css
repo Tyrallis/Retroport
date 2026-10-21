@@ -477,3 +477,10 @@ canvas.viewer:active { cursor: grabbing; }
 .sp-playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: #fff; opacity: 0.7; pointer-events: none;
   left: calc(42% + var(--playhead, 0%) * 0.58); }
 .sp-model { padding: 2px 0; overflow-wrap: anywhere; }
+.sp-ports { margin-bottom: 14px; }
+.sp-port-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.sp-port { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.sp-port .remove { margin-left: auto; }
+.sp-port-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 6px 0; }
+.sp-port-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.sp-target { width: 140px; background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 4px 6px; }

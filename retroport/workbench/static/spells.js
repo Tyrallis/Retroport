@@ -294,15 +294,19 @@ async function spOpen(id) {
   };
 
   const vis = d.visual_list;
+  let shown = vis[0] || null;
+  const port = spPortSection(d, () => shown);
   if (vis.length > 1) {
     pb.add(versionChips(vis.map((x, i) => ({
       label: `Visual ${x.id}` + (x.difficulty ? ` · difficulty ${x.difficulty}` : "") + (x.player_condition || x.unit_condition ? " · conditional" : ""),
-      on: i === 0, pick: () => { renderVisual(x); load(x); },
+      on: i === 0, pick: () => { shown = x; renderVisual(x); load(x); port.showPlan(x); },
     }))));
   }
-  showDrawer([title, subtitle, section("Preview", pb.box), section("Timeline", chart), details]);
+  showDrawer([title, subtitle, section("Preview", pb.box), section("Timeline", chart),
+              vis.length ? section("Put this visual on a spell in your game", port.box) : null, details].filter(Boolean));
   if (!vis.length) { pb.info.textContent = "This spell has no visual."; return; }
   renderVisual(vis[0]);
+  port.showPlan(vis[0]);
   if (pb.v) load(vis[0]);
 }
 
@@ -322,7 +326,114 @@ function spChart(box, plan) {
     el("div", {class: "sp-playhead"}));
 }
 
+// ---------------------------------------------------------------------------- ports into the client
+// A port puts one retail visual on one of the client's own spells; Install writes them all into
+// Data\patch-S.MPQ (spellport.py), so casting that spell shows the retail effects.
+async function spLoadPorts() {
+  try { SP.ports = await api("/api/spellport"); } catch (e) { SP.ports = {ports: [], installed: [], patch: "patch-S.MPQ"}; }
+  spRenderPorts();
+}
+
+async function spSavePorts(list) {
+  SP.ports.ports = await post("/api/spellport/ports", list);
+  spRenderPorts();
+}
+
+function spRenderPorts(result = SP.lastResult) {
+  const st = SP.ports;
+  if (!st) return;
+  const installed = new Set((st.installed || []).map(p => `${p.target}:${p.visual}`));
+  const rows = st.ports.map(p => el("div", {class: "sp-port"},
+    el("span", {}, el("b", {}, p.target_name), el("span", {class: "muted"}, ` #${p.target}`)),
+    el("span", {class: "muted"}, " shows "),
+    el("a", {href: "#", onclick: ev => { ev.preventDefault(); spOpen(p.retail); }}, p.name || `spell ${p.retail}`),
+    el("span", {class: "muted small"}, ` visual ${p.visual}`),
+    installed.has(`${p.target}:${p.visual}`) ? el("span", {class: "badge"}, "in your game") : el("span", {class: "badge dim"}, "not installed yet"),
+    el("button", {class: "remove", title: "Take this port out (Install puts the spell's own visual back)",
+      onclick: async () => { try { await spSavePorts(st.ports.filter(x => x !== p)); } catch (e) { toast(e.message); } }}, "×")));
+  const restart = el("input", {type: "checkbox", checked: !!SP.restart});
+  restart.addEventListener("change", () => { SP.restart = restart.checked; });
+  const go = el("button", {class: "btn", disabled: SP.installing}, SP.installing ? "Installing…" : "Install into the client");
+  go.addEventListener("click", spInstall);
+  const res = [];
+  if (result) {
+    if (!result.ok) res.push(el("div", {class: "warnline"}, `Install stopped: ${result.error}`));
+    else {
+      res.push(el("div", {class: "okline"}, result.ports.length
+        ? `Installed ${plural(result.ports.length, "port")} into Data\\${result.patch} (${plural(result.models, "model")}).` +
+          (result.restarted ? " The client was started again." : " Start (or restart) the client and cast the spell.")
+        : `No ports left: Data\\${result.patch} removed.`));
+      if (result.shadowed && result.shadowed.length) res.push(el("div", {class: "warnline"},
+        `A later patch overrides the spell tables: ${result.shadowed.join(", ")}`));
+      for (const p of result.ports) if (p.notes.length) res.push(el("details", {class: "small"},
+        el("summary", {}, `${p.target_name}: ${plural(p.notes.length, "thing")} 3.3.5 can't carry`),
+        ...p.notes.map(n => el("div", {class: "muted"}, n))));
+    }
+  }
+  $("#sp-ports").replaceChildren(
+    el("h3", {}, `Ported visuals · ${plural(st.ports.length, "spell")}`),
+    rows.length ? el("div", {class: "sp-port-list"}, rows)
+      : el("p", {class: "muted small"}, "None yet: open a spell and put its visual on one of your client's spells."),
+    el("div", {class: "sp-port-actions"}, go,
+      el("label", {class: "check", title: "The client holds its patches open: close it for the write and start it again after"},
+        restart, " Restart the client when done")),
+    ...res);
+}
+
+async function spInstall() {
+  if (SP.installing) return;
+  SP.installing = true; SP.lastResult = null; spRenderPorts();
+  try { SP.lastResult = await post("/api/spellport/install", {restart: !!SP.restart}); }
+  catch (e) { SP.lastResult = {ok: false, error: e.message}; }
+  SP.installing = false;
+  await spLoadPorts();
+}
+
+// the drawer's "Put this visual on a spell in your game" section
+function spPortSection(d, getVisual) {
+  const box = el("div", {class: "sp-port-form"});
+  const input = el("input", {type: "number", min: 1, placeholder: "3.3.5 spell id", class: "sp-target"});
+  const name = el("span", {class: "muted small"});
+  const add = el("button", {class: "btn", disabled: true}, "Put it on that spell");
+  const planBox = el("div", {class: "small"});
+  let target = null;
+  const check = debounce(async () => {
+    const id = +input.value;
+    target = null; add.disabled = true;
+    if (!id) { name.textContent = ""; return; }
+    try { target = await api("/api/spellport/client-spell", {id}); name.textContent = `→ ${target.name}`; add.disabled = false; }
+    catch (e) { name.textContent = e.message; }
+  }, 300);
+  input.addEventListener("input", check);
+  add.addEventListener("click", async () => {
+    const vis = getVisual();
+    if (!target || !vis) return;
+    const list = (SP.ports ? SP.ports.ports : []).filter(p => p.target !== target.id);
+    list.push({target: target.id, retail: d.id, visual: vis.id, name: d.name});
+    try { await spSavePorts(list); toast(`${target.name} will show ${d.name} after Install`); }
+    catch (e) { toast(e.message); }
+  });
+  const showPlan = async vis => {
+    planBox.replaceChildren(el("span", {class: "muted"}, "Working out the 3.3.5 kits…"));
+    try {
+      const pl = await api("/api/spellport/plan", {visual: vis.id});
+      const kits = Object.entries(pl.kits).map(([col, k]) => el("div", {},
+        el("b", {}, pl.names[col] || col), ": ",
+        [...Object.entries(k.slots).map(([s, m]) => `${(m.path || String(m.fdid)).split("/").pop()} (${s.replace("Effect", "").toLowerCase()})`),
+         ...k.specials.map(m => `${(m.path || String(m.fdid)).split("/").pop()} (special)`)].join(", ") || "no models",
+        k.anim != null ? el("span", {class: "muted"}, ` · animation ${k.anim}`) : null));
+      if (pl.missile) kits.push(el("div", {}, el("b", {}, "missile"), `: ${(pl.missile.path || String(pl.missile.fdid)).split("/").pop()}`));
+      planBox.replaceChildren(...kits,
+        pl.dropped.length ? el("details", {}, el("summary", {class: "muted"}, `${plural(pl.dropped.length, "thing")} 3.3.5 can't carry`),
+          ...pl.dropped.map(x => el("div", {class: "muted"}, x))) : null);
+    } catch (e) { planBox.replaceChildren(el("span", {class: "warnline"}, e.message)); }
+  };
+  box.append(el("div", {class: "sp-port-row"}, input, name, add), planBox);
+  return {box, showPlan};
+}
+
 function spShow() {
+  spLoadPorts();
   if (!SP.wired) {
     SP.wired = true;
     const run = debounce(() => spSearch(true), 300);
