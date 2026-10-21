@@ -45,7 +45,8 @@ from .wago import http_get
 PATCH_NAME = "patch-R.MPQ"
 ROOT = "Creature\\Retroport"
 LISTFILE_URL = "https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv"
-INDEX_VERSION = 3
+INDEX_VERSION = 4               # 4: displays keep the fourth creature skin (texture type 5)
+FOURTH_SKIN_TYPE = 5            # the M2 texture type modern models give retail's fourth creature skin
 DISPLAY_FLOOR = 100000          # new display / model ids start above this and above every id in use
 ENTRY_FLOOR = 900000            # new creature_template entries start here
 PAGE = 60
@@ -133,7 +134,7 @@ class CreatureIndex:
                 continue
             tex = [int(x or 0) for x in (r.get("TextureVariationFileDataID") or [0, 0, 0, 0])]
             displays[did] = {"m": mid, "s": round(float(r.get("CreatureModelScale") or 1.0), 4),
-                             "a": int(r.get("CreatureModelAlpha") or 255), "t": tex[:3],
+                             "a": int(r.get("CreatureModelAlpha") or 255), "t": (tex + [0] * 4)[:4],
                              "x": int(r.get("ExtendedDisplayInfoID") or 0)}
         names: dict[int, list] = {}
         for cid, r in src.table("Creature"):
@@ -195,7 +196,7 @@ class CreatureIndex:
         path = self.paths.get(model["f"], "")
         return {"display": did, "name": self.label(did), "creatures": self.names.get(did, [])[:12],
                 "model": model["f"], "model_data": d["m"], "path": path, "stem": _stem_of(path, f"display{did}"),
-                "scale": d["s"], "alpha": d["a"], "textures": [t for t in d["t"] if t],
+                "scale": d["s"], "alpha": d["a"], "textures": [t for t in d["t"] if t], "t": list(d["t"]),
                 "humanoid": bool(d["x"]), "geo": model["geo"], "model_scale": model["scale"],
                 "collision": [model["cw"], model["ch"]]}
 
@@ -252,13 +253,28 @@ def load_index(src, cache_dir: str, listfile_candidates: list[str], say=lambda m
 
 
 def textures_of(row: dict) -> dict[int, int]:
-    """The display's creature skins as the viewer's texture-type map (types 11, 12, 13)."""
-    return {11 + k: t for k, t in enumerate(row_textures(row)) if t}
+    """The display's creature skins as the viewer's texture-type map (types 11, 12, 13, and 5 for the
+    fourth skin modern models use)."""
+    out = {11 + k: t for k, t in enumerate(row_textures(row)) if t}
+    if row_fourth_texture(row):
+        out[FOURTH_SKIN_TYPE] = row_fourth_texture(row)
+    return out
+
+
+def _row_slots(row: dict) -> list[int]:
+    t = list(row.get("t") or row.get("textures") or [])
+    return (t + [0, 0, 0, 0])[:4]
 
 
 def row_textures(row: dict) -> list[int]:
-    t = list(row.get("t") or row.get("textures") or [])
-    return (t + [0, 0, 0])[:3]
+    """The three creature skins a 3.3.5 CreatureDisplayInfo row can name (texture types 11-13)."""
+    return _row_slots(row)[:3]
+
+
+def row_fourth_texture(row: dict) -> int:
+    """Retail's fourth creature skin (TextureVariationFileDataID[3]). Modern models take it on texture
+    type 5, which the 3.3.5 client never fills - so the export bakes it into the model."""
+    return _row_slots(row)[3]
 
 
 # -- one model's files ----------------------------------------------------------------------------
@@ -275,6 +291,34 @@ def _chunks(data: bytes) -> dict[str, bytes]:
 
 def _u32s(b: bytes) -> list[int]:
     return list(struct.unpack(f"<{len(b) // 4}I", b[:len(b) // 4 * 4]))
+
+
+def bake_texture_type(m2: bytes, tex_type: int, fdid: int) -> tuple[bytes, int]:
+    """Turn every texture of ``tex_type`` into a hardcoded one (type 0) whose TXID entry is ``fdid``:
+    what the client cannot fill from a creature row, the model then names itself. Returns the model
+    and how many textures changed."""
+    out = bytearray(m2)
+    spans, pos = {}, 0
+    while pos + 8 <= len(out):
+        tag = bytes(out[pos:pos + 4])
+        size = struct.unpack_from("<I", out, pos + 4)[0]
+        spans.setdefault(tag, (pos + 8, size))
+        pos += 8 + size
+    if b"MD21" not in spans or b"TXID" not in spans:
+        return m2, 0
+    md, md_size = spans[b"MD21"]
+    tx, tx_size = spans[b"TXID"]
+    count, off = struct.unpack_from("<II", out, md + 0x50)
+    if off + 16 * count > md_size:
+        return m2, 0
+    baked = 0
+    for i in range(min(count, tx_size // 4)):
+        entry = md + off + 16 * i
+        if struct.unpack_from("<I", out, entry)[0] == tex_type:
+            struct.pack_into("<I", out, entry, 0)
+            struct.pack_into("<I", out, tx + 4 * i, fdid)
+            baked += 1
+    return bytes(out), baked
 
 
 class Export:
@@ -397,6 +441,12 @@ def export_display(read, row: dict, stem: str) -> Export:
     for k, fdid in enumerate(row_textures(row)):
         if fdid:
             ex.variations[k] = texture(fdid)
+    fourth = row_fourth_texture(row)
+    if fourth and texture(fourth):
+        m2, baked = bake_texture_type(m2, FOURTH_SKIN_TYPE, fourth)
+        if baked:
+            ex.put(f"{stem}.m2", m2)
+            ex.notes.append(f"fourth creature skin {fourth} baked into {baked} texture(s) of type {FOURTH_SKIN_TYPE}")
     ex.put(f"{stem}.manifest.json", json.dumps({"fileDataID": row["model"], "textures": manifest}, indent=1).encode())
     return ex
 
