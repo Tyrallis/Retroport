@@ -24,6 +24,8 @@ API (GET unless noted):
   /api/preview?source=&display=&race=&sex=     a display's models (meshes, Stand) and body textures
   /api/body?race=&sex=           a BfA body: mesh, skin layers, layout, hair, default geosets
   /api/outfit?source=&race=&sex=&items=<display>:<slot>,...   what each piece puts on that body
+  /api/spells?q=&page=&models=   retail spells (spells.py); /api/spell?id= one spell's visuals, events, timing
+  /api/spell/model?fdid=&texture=   a spell model's mesh; /api/spell/stage the stand-in caster and target
   /icon/<source>/<fdid>.png      an icon from the source's files (cached as PNG); /tex/... a texture
 """
 
@@ -47,6 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import catalog as C
 from . import character as CH
 from . import creatures as CR
+from . import spells as SP
 from . import kit as K
 from . import itemstats as IS
 from . import models as M
@@ -195,6 +198,7 @@ class Workbench:
         self._client_options: dict | None = None
         self._options_lock = threading.Lock()
         self.creatures = CR.Creatures(self)
+        self.spells = SP.Spells(self)
         self.configure()
 
     def configure(self) -> None:
@@ -1106,6 +1110,14 @@ def make_handler(wb: Workbench):
                 return self._json(wb.creatures.state())
             if path == "/api/creatures/job":
                 return self._json(wb.creatures.job_view(_int(q.get("since")) or 0))
+            if path == "/api/spells":
+                return self._json(wb.spells.search(q.get("q", ""), _int(q.get("page")) or 0, q.get("models") != "0"))
+            if path == "/api/spell":
+                return self._json(wb.spells.detail(_int(q.get("id")) or 0))
+            if path == "/api/spell/model":
+                return self._json(wb.spells.model(_int(q.get("fdid")) or 0, _int(q.get("texture")) or 0))
+            if path == "/api/spell/stage":
+                return self._json(wb.spells.stage())
             if path == "/api/kit/log":
                 return self._json(wb.kit.log_since(_int(q.get("since")) or 0))
             cat = wb.catalog(q.get("source", ""))

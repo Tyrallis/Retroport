@@ -315,6 +315,51 @@ class Viewer {
       gl.deleteVertexArray(p.vao); p.buffers.forEach(b => gl.deleteBuffer(b)); gl.deleteTexture(p.boneTex);
     }
     this.parts = [];
+    this.clock = null;
+  }
+
+  // -- a timeline (the spell preview): parts with opts.window [from, to) ms show only then, and play
+  // their own animation from their start. It loops over length ms; onTick(t) follows it.
+  timeline(length, onTick = null) {
+    const speed = this.clock ? this.clock.speed : 1;
+    this.clock = {start: performance.now(), length: Math.max(1, length), paused: false, at: 0, last: 0, onTick, speed};
+    this.draw();
+  }
+  time() {
+    const c = this.clock;
+    if (!c) return 0;
+    return c.paused ? c.at : ((performance.now() - c.start) * c.speed) % c.length;
+  }
+  seek(t) {
+    const c = this.clock;
+    if (!c) return;
+    c.at = Math.max(0, Math.min(c.length - 1, t));
+    c.start = performance.now() - c.at / c.speed;
+    for (const p of this.parts) for (const em of p.emitters) em.list = [];
+    this.draw();
+  }
+  pause(on) {
+    const c = this.clock;
+    if (!c) return;
+    if (on && !c.paused) { c.at = this.time(); c.paused = true; }
+    else if (!on && c.paused) { c.paused = false; c.start = performance.now() - c.at / c.speed; }
+    this.draw();
+  }
+  // slow motion: 1 is the game's pace
+  rate(speed) {
+    const c = this.clock;
+    if (!c) return;
+    const t = this.time();
+    c.speed = speed;
+    c.start = performance.now() - t / speed;
+  }
+  active(p, t) {
+    const w = p.opts.window;
+    return !w || !this.clock || (t >= w[0] && t < w[1]);
+  }
+  localTime(p, now, t) {
+    const w = p.opts.window;
+    return w && this.clock ? Math.max(0, t - w[0]) : now;
   }
 
   texture(src) {
@@ -397,6 +442,7 @@ class Viewer {
   }
 
   animated() {
+    if (this.clock && !this.clock.paused) return true;
     return this.parts.some(p => p.bones.some(b => b.t || b.r || b.s) || p.opts.bodyOf || p.opts.attach || p.emitters.length ||
                                 (p.mesh.uvanims || []).some(u => u.t || u.r || u.s) ||
                                 (p.mesh.colors || []).length || (p.mesh.weights || []).some(w => w && w.t.length > 1));
@@ -519,20 +565,29 @@ class Viewer {
     const body = att.part, a = (body.mesh.attachments || []).find(x => x[0] === att.id);
     if (!a) return null;
     const bm = body.world[a[1]] || IDENT;
-    return M4.translate(bm, [a[2], a[3], a[4]]);
+    const local = M4.translate(bm, [a[2], a[3], a[4]]);
+    // a body placed somewhere (a spell's target): its points are where it stands
+    return body.opts.place ? M4.mul(this.modelMatrix(body), local) : local;
   }
 
+  // opts.place(viewer, t): the part's frame from a callback (a spell's model on a stand-in, a missile
+  // in flight); opts.scale: uniform scale after the offset
   modelMatrix(p) {
-    let model = p.opts.attach ? this.attachMatrix(p.opts.attach) : (p.orient || IDENT);
+    let model = p.opts.place ? p.opts.place(this, this.time()) : p.opts.attach ? this.attachMatrix(p.opts.attach) : (p.orient || IDENT);
     if (!model) return null;
     if (p.offset[0] || p.offset[1] || p.offset[2]) model = M4.translate(model, p.offset);
+    const s = p.opts.scale;
+    if (s && s !== 1) {
+      model = new Float32Array(model);
+      for (let k = 0; k < 12; k++) if (k % 4 !== 3) model[k] *= s;
+    }
     return model;
   }
 
-  update(now) {
-    const eye = this.eye();
+  update(now0) {
+    const eye = this.eye(), T = this.time();
     for (const p of this.parts) {
-      const m = p.mesh;
+      const m = p.mesh, now = this.localTime(p, now0, T);
       // texture animations, colours and transparency
       p.uvMats = (m.uvanims || []).map(u => M4.bone([0.5, 0.5, 0], sample(u.t, now, m.duration, m.globals, 3) || [0, 0, 0],
         sample(u.r, now, m.duration, m.globals, 4) || [0, 0, 0, 1], sample(u.s, now, m.duration, m.globals, 3) || [1, 1, 1],
@@ -569,12 +624,13 @@ class Viewer {
   // Particles: born at their emitter (on its bone) at its rate, flying out within its spread at its
   // speed, pulled by gravity and drag, living their lifespan; drawn as camera-facing sprites coloured,
   // faded and sized along their life, a sprite-sheet cell each.
-  particles(now, dt) {
+  particles(now0, dt) {
+    const T = this.time();
     for (const p of this.parts) {
       if (!p.emitters.length) continue;
       const model = this.modelMatrix(p);
       if (!model) continue;
-      const m = p.mesh;
+      const m = p.mesh, now = this.localTime(p, now0, T), on = this.active(p, T);
       for (const em of p.emitters) {
         const d = em.def;
         for (const q of em.list) {
@@ -585,6 +641,7 @@ class Viewer {
           for (let k = 0; k < 3; k++) { q.v[k] *= drag; q.p[k] += q.v[k] * dt; }
         }
         em.list = em.list.filter(q => q.age < q.life);
+        if (!on) continue;                                 // outside its time: what flies, flies on
         if (d.enabled && value(d.enabled, now, m, 1) < 0.5) continue;
         const rate = Math.max(0, value(d.rate, now, m, 0) + rnd() * d.rate_var);
         em.acc += rate * dt;
@@ -697,8 +754,15 @@ class Viewer {
     if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
     const now = performance.now() - this.start0, dt = this.last ? Math.min(0.1, (now - this.last) / 1000) : 0;
     this.last = now;
+    const clk = this.clock, T = this.time();
+    if (clk) {
+      if (T < clk.last) for (const p of this.parts) for (const em of p.emitters) em.list = [];   // looped round
+      clk.last = T;
+      if (clk.onTick) clk.onTick(T);
+    }
     this.update(now);
-    this.particles(now, dt);
+    // on a timeline, particles move at its pace: slowed with it, frozen while it's paused
+    this.particles(now, clk ? (clk.paused ? 0 : dt * clk.speed) : dt);
     gl.viewport(0, 0, w, h);
     gl.clearColor(0.07, 0.08, 0.1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
@@ -712,6 +776,7 @@ class Viewer {
     const uvMat = (p, i) => i >= 0 && p.uvMats[i] ? p.uvMats[i] : IDENT;
     for (const pass of [0, 1]) {
       for (const p of this.parts) {
+        if (!this.active(p, T)) continue;
         const model = this.modelMatrix(p);
         if (!model) continue;
         gl.uniformMatrix4fv(this.u.uModel, false, model);

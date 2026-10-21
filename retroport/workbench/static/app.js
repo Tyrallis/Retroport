@@ -1139,6 +1139,7 @@ function show(view) {
   if (view === "settings") openSettings();
   if (view === "stats") loadStats();
   if (view === "creatures" && typeof crShow === "function") crShow();
+  if (view === "spells" && typeof spShow === "function") spShow();
   $("#q").placeholder = view === "sets" ? "Search sets by name, version or group   ( / )" : "Search items by name or id   ( / )";
 }
 function fill(sel, entries) {

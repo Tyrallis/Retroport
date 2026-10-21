@@ -35,6 +35,20 @@ server - in one click, with a backup of everything it changes and an Undo.
   and can undo the whole install. It never touches your database: it shows the item SQL for you to
   apply.
 
+## Spells (preview)
+
+The **Spells** page shows retail's spells as the game plays them. Open a spell and its visual plays on
+a stand-in caster (Jaina) and a training post 12 yards away: every model each event of the cast
+(precast, cast, travel, impact, aura, channel, area trigger) puts on the caster, the target or the
+ground, at its attachment point, offset, turn and scale, from its moment to its end, and the
+missiles in flight - timed from the spell's retail cast time, missile speed and duration. A
+timeline charts each model; pause, scrub and slow motion (down to a tenth) let you study it.
+
+The first visit reads retail's spell tables from wago.tools once (a few minutes) into
+`cache\spells-<build>.pickle`. Not shown yet: positioners (scripted paths - the model stays at
+its point), caster animations, sounds, chain effects, and the extra layers of multi-texture
+particles. Porting spells to a 3.3.5 client and server is the next step.
+
 ## Creatures (WarcraftXL clients with wxl.modern-m2)
 
 The **Creatures** page ports retail's creatures and doodads. It needs a client that reads modern
