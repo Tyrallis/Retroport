@@ -91,21 +91,32 @@ def moment(start: int, target: int) -> str | None:
     return None
 
 
-def plan(visual: dict) -> dict:
-    """Where each part of a retail visual (SpellIndex.visual) goes in 3.3.5, and what can't."""
+def plan(visual: dict, timing: dict | None = None) -> dict:
+    """Where each part of a retail visual (SpellIndex.visual) goes in 3.3.5, and what can't.
+    ``timing`` (SpellIndex.timing): a ground effect retail plays once near the end of the cast
+    (Black Hole's burst, 4.5 s into a 5 s cast) goes to the ground kit of the cast itself."""
     kits: dict[str, dict] = {}
     dropped: list[str] = []
+    cast = (timing or {}).get("cast", 0)
     for e in visual["events"]:
         col = moment(e["start"], e["target"])
         what = f"{e['start_name']} on the {e['target_name']}"
+        late = e["offset"][0] + e["kit_delay"][0]
+        moved_to_cast = False
+        if col is None and e["start"] == 1 and e["target"] == 3 and e["models"] and \
+                (e["end"] == 13 and cast and late >= cast - 1000):
+            col, moved_to_cast = "InstantAreaKit", True
         if col is None:
             if e["models"]:
-                dropped.append(f"{what}: 3.3.5 has no such moment ({len(e['models'])} model(s) left out)")
+                why = " (it shows on the ground while casting)" if e["start"] == 1 and e["target"] == 3 else ""
+                dropped.append(f"{what}: 3.3.5 has no such moment{why} - {len(e['models'])} model(s) left out")
             continue
         kit = kits.setdefault(col, {"slots": {}, "specials": [], "anim": None, "events": []})
         kit["events"].append(what)
-        if e["offset"][0] or e["kit_delay"][0]:
-            dropped.append(f"{what}: starts {e['offset'][0] + e['kit_delay'][0]} ms late in retail; 3.3.5 starts it at once")
+        if moved_to_cast:
+            dropped.append(f"{what}: plays when the cast ends ({cast - late} ms after retail's moment)")
+        elif late:
+            dropped.append(f"{what}: starts {late} ms late in retail; 3.3.5 starts it at once")
         for m in e["models"]:
             slot = ATTACH_SLOTS.get(m["attachment"])
             entry = {"fdid": m["fdid"], "path": m["path"], "scale": round((m["scale"] or 1) * (m["attach_scale"] or 1), 4),
@@ -288,7 +299,7 @@ class SpellPort:
     def preview_plan(self, visual_id: int, spell_id: int = 0) -> dict:
         idx = self.spells.index()
         vis = idx.visual(visual_id)
-        out = plan(vis)
+        out = plan(vis, idx.timing(spell_id) if spell_id else None)
         if spell_id:
             out["templates"] = suggest_templates(vis, idx.timing(spell_id))
             out["kind"] = spell_kind(vis, idx.timing(spell_id))
@@ -487,8 +498,8 @@ class SpellPort:
                 effect_names[key] = eid
             return effect_names[key]
 
-        def visual_rows(vis_id: int, port_notes: list) -> int:
-            pl = plan(idx.visual(vis_id))
+        def visual_rows(vis_id: int, port_notes: list, timing: dict | None = None) -> int:
+            pl = plan(idx.visual(vis_id), timing)
             port_notes.extend(pl["dropped"])
             vrow = [0] * VISUAL_FIELDS
             vid = new("v")
@@ -562,7 +573,7 @@ class SpellPort:
             t = idx.timing(p["retail"])
             r = retail.get(p["retail"], {})
             misc = idx.misc.get(p["retail"], (0,) * 7)
-            vid = visual_rows(p["visual"], pn) if p["visual"] else 0
+            vid = visual_rows(p["visual"], pn, t) if p["visual"] else 0
             iid = icon(misc[6], pn)
 
             def build(rec: bytes, table: D.RawDBC) -> list[int]:
