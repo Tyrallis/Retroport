@@ -35,6 +35,35 @@ server - in one click, with a backup of everything it changes and an Undo.
   and can undo the whole install. It never touches your database: it shows the item SQL for you to
   apply.
 
+## Creatures (WarcraftXL clients with wxl.modern-m2)
+
+The **Creatures** page ports retail's creatures and doodads. It needs a client that reads modern
+models natively: the x64 WarcraftXL client with the `wxl.modern-m2` mod. Nothing is converted:
+the client gets retail's own files.
+
+- **Browse** every retail creature display (about 121,000), live from wago.tools. Search by name,
+  model path, display id or creature id, and see each one in 3D with the same viewer the items use.
+  Variations of one model (its other skins) are a click away.
+- **Basket**: give each creature its name, subtitle, level, faction, rank and scale.
+- **Install creatures** does it all in one go:
+  1. It downloads the model, its skins, `.anim` files and every texture. Each file is named the way
+     the client looks for it, under `Creature\Retroport\<model>\`, with a wow.export manifest so
+     the mod resolves textures by FileDataID. A model whose skeleton lives in a `.skel` file is made
+     self-contained first.
+  2. It adds a CreatureModelData and a CreatureDisplayInfo row for each creature to the client's own
+     tables, and packs everything into `Data\patch-R.MPQ`.
+  3. It adds the same rows to the server's dbc folder. A copy of the originals is kept the first
+     time, and every install builds on it.
+  4. It writes `creature_template`, `creature_template_model` and `creature_model_info` rows, and
+     **runs them** with the MySQL client on the world database that `worldserver.conf` names. Turn
+     that off and it saves the SQL for you instead.
+
+  Ids are kept per creature, so installing again (with new names, say) or taking one out never
+  stacks rows. Restart the worldserver, then `.npc add <entry>` (each entry is listed with a copy
+  button).
+- **Not ported:** dressed humanoid NPCs (their look is baked from character parts), and models
+  whose `.skel` builds on a shared parent skeleton.
+
 ## Download and run
 
 1. Download `Retroport-Workbench-<version>-win64.zip` from the [Releases](../../releases) page.

@@ -46,6 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import catalog as C
 from . import character as CH
+from . import creatures as CR
 from . import kit as K
 from . import itemstats as IS
 from . import models as M
@@ -193,6 +194,7 @@ class Workbench:
         self._reference: dict | None = None
         self._client_options: dict | None = None
         self._options_lock = threading.Lock()
+        self.creatures = CR.Creatures(self)
         self.configure()
 
     def configure(self) -> None:
@@ -1018,6 +1020,12 @@ def make_handler(wb: Workbench):
                     b = body or {}
                     patterns = [tuple(x) for x in b.get("patterns") or []] or None
                     self._json({"path": P.pick(bool(b.get("folder", True)), b.get("title", ""), b.get("start", ""), patterns)})
+                elif url.path == "/api/creatures/basket":
+                    self._json(wb.creatures.set_basket(body or []))
+                elif url.path == "/api/creatures/settings":
+                    self._json(wb.creatures.set_settings(body or {}))
+                elif url.path == "/api/creatures/install":
+                    self._json(wb.creatures.start_install())
                 elif url.path == "/api/kit/run":
                     wb.run_kit((body or {}).get("action", ""), (body or {}).get("step", ""))
                     self._json(wb.kit_status())
@@ -1087,6 +1095,17 @@ def make_handler(wb: Workbench):
                 return self._json(wb.basket_plan())
             if path == "/api/kit":
                 return self._json(wb.kit_status() | wb.install_notes())
+            if path == "/api/creatures":
+                return self._json(wb.creatures.search(q.get("q", ""), _int(q.get("page")) or 0,
+                                                      q.get("humanoids") == "1", q.get("named") == "1"))
+            if path == "/api/creature":
+                return self._json(wb.creatures.detail(_int(q.get("display")) or 0))
+            if path == "/api/creature/preview":
+                return self._json(wb.creatures.preview(_int(q.get("display")) or 0))
+            if path == "/api/creatures/state":
+                return self._json(wb.creatures.state())
+            if path == "/api/creatures/job":
+                return self._json(wb.creatures.job_view(_int(q.get("since")) or 0))
             if path == "/api/kit/log":
                 return self._json(wb.kit.log_since(_int(q.get("since")) or 0))
             cat = wb.catalog(q.get("source", ""))

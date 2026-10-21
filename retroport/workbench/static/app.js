@@ -1138,6 +1138,7 @@ function show(view) {
   if (view === "backport") loadKit();
   if (view === "settings") openSettings();
   if (view === "stats") loadStats();
+  if (view === "creatures" && typeof crShow === "function") crShow();
   $("#q").placeholder = view === "sets" ? "Search sets by name, version or group   ( / )" : "Search items by name or id   ( / )";
 }
 function fill(sel, entries) {
