@@ -1133,7 +1133,7 @@ def make_handler(wb: Workbench):
             if path == "/api/spellport":
                 return self._json(wb.spells.port.state())
             if path == "/api/spellport/plan":
-                return self._json(wb.spells.port.preview_plan(_int(q.get("visual")) or 0))
+                return self._json(wb.spells.port.preview_plan(_int(q.get("visual")) or 0, _int(q.get("spell")) or 0))
             if path == "/api/spellport/client-spell":
                 return self._json(wb.spells.port.client_spell(_int(q.get("id")) or 0))
             if path == "/api/kit/log":

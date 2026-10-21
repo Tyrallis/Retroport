@@ -303,7 +303,7 @@ async function spOpen(id) {
     }))));
   }
   showDrawer([title, subtitle, section("Preview", pb.box), section("Timeline", chart),
-              vis.length ? section("Put this visual on a spell in your game", port.box) : null, details].filter(Boolean));
+              vis.length ? section("Make a new spell", port.box) : null, details].filter(Boolean));
   if (!vis.length) { pb.info.textContent = "This spell has no visual."; return; }
   renderVisual(vis[0]);
   port.showPlan(vis[0]);
@@ -339,44 +339,52 @@ async function spSavePorts(list) {
   spRenderPorts();
 }
 
+// New spells: each a retail spell's name, text, icon, timing and visual on the mechanics of one of
+// your client's spells, with an id of its own. Install puts them in the client (Data\patch-S.MPQ)
+// and the server's dbc folder; .learn <id> in game.
 function spRenderPorts(result = SP.lastResult) {
   const st = SP.ports;
   if (!st) return;
-  const installed = new Set((st.installed || []).map(p => `${p.target}:${p.visual}`));
+  const installed = new Set((st.installed || []).map(p => `${p.id}:${p.template}:${p.visual}:${p.name}`));
   const rows = st.ports.map(p => el("div", {class: "sp-port"},
-    el("span", {}, el("b", {}, p.target_name), el("span", {class: "muted"}, ` #${p.target}`)),
-    el("span", {class: "muted"}, " shows "),
-    el("a", {href: "#", onclick: ev => { ev.preventDefault(); spOpen(p.retail); }}, p.name || `spell ${p.retail}`),
-    el("span", {class: "muted small"}, ` visual ${p.visual}`),
-    installed.has(`${p.target}:${p.visual}`) ? el("span", {class: "badge"}, "in your game") : el("span", {class: "badge dim"}, "not installed yet"),
-    el("button", {class: "remove", title: "Take this port out (Install puts the spell's own visual back)",
+    el("b", {}, p.name), el("span", {class: "muted"}, ` #${p.id}`),
+    el("span", {class: "muted small"}, ` · looks: `),
+    el("a", {href: "#", onclick: ev => { ev.preventDefault(); spOpen(p.retail); }}, p.retail_name || `spell ${p.retail}`),
+    el("span", {class: "muted small"}, ` · works like ${p.template_name} (${p.template})`),
+    installed.has(`${p.id}:${p.template}:${p.visual}:${p.name}`)
+      ? el("button", {class: "copy", title: "Copy the GM command", onclick: () => copy(`.learn ${p.id}`)}, `.learn ${p.id}`)
+      : el("span", {class: "badge dim"}, "not installed yet"),
+    el("button", {class: "remove", title: "Take this spell out at the next Install",
       onclick: async () => { try { await spSavePorts(st.ports.filter(x => x !== p)); } catch (e) { toast(e.message); } }}, "×")));
   const restart = el("input", {type: "checkbox", checked: !!SP.restart});
   restart.addEventListener("change", () => { SP.restart = restart.checked; });
-  const go = el("button", {class: "btn", disabled: SP.installing}, SP.installing ? "Installing…" : "Install into the client");
+  const go = el("button", {class: "btn", disabled: SP.installing}, SP.installing ? "Installing…" : "Install new spells");
   go.addEventListener("click", spInstall);
   const res = [];
   if (result) {
     if (!result.ok) res.push(el("div", {class: "warnline"}, `Install stopped: ${result.error}`));
     else {
-      res.push(el("div", {class: "okline"}, result.ports.length
-        ? `Installed ${plural(result.ports.length, "port")} into Data\\${result.patch} (${plural(result.models, "model")}).` +
-          (result.restarted ? " The client was started again." : " Start (or restart) the client and cast the spell.")
-        : `No ports left: Data\\${result.patch} removed.`));
+      res.push(el("div", {class: "okline"}, result.made
+        ? `Installed ${plural(result.made, "new spell")} into Data\\${result.patch}` +
+          (result.server ? " and your server's spell tables." : " (no server dbc folder in Settings: the server can't cast them).") +
+          (result.restarted && result.restarted.length ? ` Started again: ${result.restarted.join(" and ")}.`
+                                                       : " Restart the worldserver and the client, then .learn the spell.")
+        : `No new spells left: Data\\${result.patch} removed.`));
+      if (result.note) res.push(el("div", {class: "warnline"}, result.note));
       if (result.shadowed && result.shadowed.length) res.push(el("div", {class: "warnline"},
         `A later patch overrides the spell tables: ${result.shadowed.join(", ")}`));
-      for (const p of result.ports) if (p.notes.length) res.push(el("details", {class: "small"},
-        el("summary", {}, `${p.target_name}: ${plural(p.notes.length, "thing")} 3.3.5 can't carry`),
+      for (const p of result.spells) if (p.notes.length) res.push(el("details", {class: "small"},
+        el("summary", {}, `${p.name}: ${plural(p.notes.length, "note")}`),
         ...p.notes.map(n => el("div", {class: "muted"}, n))));
     }
   }
   $("#sp-ports").replaceChildren(
-    el("h3", {}, `Ported visuals · ${plural(st.ports.length, "spell")}`),
+    el("h3", {}, `Your new spells · ${plural(st.ports.length, "spell")}`),
     rows.length ? el("div", {class: "sp-port-list"}, rows)
-      : el("p", {class: "muted small"}, "None yet: open a spell and put its visual on one of your client's spells."),
+      : el("p", {class: "muted small"}, "None yet: open a spell and make a new spell from it."),
     el("div", {class: "sp-port-actions"}, go,
-      el("label", {class: "check", title: "The client holds its patches open: close it for the write and start it again after"},
-        restart, " Restart the client when done")),
+      el("label", {class: "check", title: "Close the client and the worldserver for the write and start them again after"},
+        restart, " Restart the worldserver and client when done")),
     ...res);
 }
 
@@ -389,46 +397,62 @@ async function spInstall() {
   await spLoadPorts();
 }
 
-// the drawer's "Put this visual on a spell in your game" section
+// the drawer's "Make a new spell" section: a name, the 3.3.5 spell whose mechanics it borrows (the
+// suggestions fit the retail spell's kind and school), what the visual becomes in 3.3.5
 function spPortSection(d, getVisual) {
   const box = el("div", {class: "sp-port-form"});
-  const input = el("input", {type: "number", min: 1, placeholder: "3.3.5 spell id", class: "sp-target"});
-  const name = el("span", {class: "muted small"});
-  const add = el("button", {class: "btn", disabled: true}, "Put it on that spell");
+  const name = el("input", {type: "text", value: d.name, maxlength: 100, class: "sp-name", "aria-label": "Name"});
+  const tplInput = el("input", {type: "number", min: 1, placeholder: "3.3.5 spell id", class: "sp-target", "aria-label": "Template spell"});
+  const tplName = el("span", {class: "muted small"});
+  const chips = el("div", {class: "chips"});
+  const add = el("button", {class: "btn", disabled: true}, "Make this spell");
   const planBox = el("div", {class: "small"});
-  let target = null;
-  const check = debounce(async () => {
-    const id = +input.value;
-    target = null; add.disabled = true;
-    if (!id) { name.textContent = ""; return; }
-    try { target = await api("/api/spellport/client-spell", {id}); name.textContent = `→ ${target.name}`; add.disabled = false; }
-    catch (e) { name.textContent = e.message; }
-  }, 300);
-  input.addEventListener("input", check);
+  let tpl = null;
+  const pick = async id => {
+    tplInput.value = id;
+    tpl = null; add.disabled = true;
+    if (!id) { tplName.textContent = ""; return; }
+    tplName.textContent = "…";
+    try { tpl = await api("/api/spellport/client-spell", {id}); tplName.textContent = `→ ${tpl.name}`; add.disabled = false; }
+    catch (e) { tplName.textContent = e.message; }
+  };
+  tplInput.addEventListener("input", debounce(() => pick(+tplInput.value), 300));
   add.addEventListener("click", async () => {
     const vis = getVisual();
-    if (!target || !vis) return;
-    const list = (SP.ports ? SP.ports.ports : []).filter(p => p.target !== target.id);
-    list.push({target: target.id, retail: d.id, visual: vis.id, name: d.name});
-    try { await spSavePorts(list); toast(`${target.name} will show ${d.name} after Install`); }
-    catch (e) { toast(e.message); }
+    if (!tpl || !vis) return;
+    const list = SP.ports ? [...SP.ports.ports] : [];
+    list.push({retail: d.id, retail_name: d.name, visual: vis.id, template: tpl.id, name: name.value.trim() || d.name});
+    try {
+      await spSavePorts(list);
+      const made = SP.ports.ports[SP.ports.ports.length - 1];
+      toast(`${made.name} will be spell ${made.id} after Install`);
+    } catch (e) { toast(e.message); }
   });
   const showPlan = async vis => {
     planBox.replaceChildren(el("span", {class: "muted"}, "Working out the 3.3.5 kits…"));
     try {
-      const pl = await api("/api/spellport/plan", {visual: vis.id});
+      const pl = await api("/api/spellport/plan", {visual: vis.id, spell: d.id});
+      chips.replaceChildren(...(pl.templates || []).map(t => el("button", {class: "chip", title: `Spell ${t.id}`,
+        onclick: () => pick(t.id)}, t.name)));
+      if (!tplInput.value && pl.templates && pl.templates.length) pick(pl.templates[0].id);
       const kits = Object.entries(pl.kits).map(([col, k]) => el("div", {},
         el("b", {}, pl.names[col] || col), ": ",
         [...Object.entries(k.slots).map(([s, m]) => `${(m.path || String(m.fdid)).split("/").pop()} (${s.replace("Effect", "").toLowerCase()})`),
          ...k.specials.map(m => `${(m.path || String(m.fdid)).split("/").pop()} (special)`)].join(", ") || "no models",
         k.anim != null ? el("span", {class: "muted"}, ` · animation ${k.anim}`) : null));
       if (pl.missile) kits.push(el("div", {}, el("b", {}, "missile"), `: ${(pl.missile.path || String(pl.missile.fdid)).split("/").pop()}`));
-      planBox.replaceChildren(...kits,
+      planBox.replaceChildren(el("div", {class: "muted"}, `Looks (a ${pl.kind || "spell"} visual in 3.3.5):`), ...kits,
         pl.dropped.length ? el("details", {}, el("summary", {class: "muted"}, `${plural(pl.dropped.length, "thing")} 3.3.5 can't carry`),
           ...pl.dropped.map(x => el("div", {class: "muted"}, x))) : null);
     } catch (e) { planBox.replaceChildren(el("span", {class: "warnline"}, e.message)); }
   };
-  box.append(el("div", {class: "sp-port-row"}, input, name, add), planBox);
+  box.append(
+    el("div", {class: "sp-port-row"}, el("span", {class: "muted small"}, "Name"), name),
+    el("div", {class: "sp-port-row"}, el("span", {class: "muted small"}, "Works like"), tplInput, tplName),
+    chips,
+    el("p", {class: "muted small"}, "Your new spell gets this retail spell's name, description, icon, cast time, range, duration, " +
+      "cooldown, school and visual - and the mechanics (damage, effects, targets) of the 3.3.5 spell it works like."),
+    el("div", {class: "sp-port-row"}, add), planBox);
   return {box, showPlan};
 }
 

@@ -484,3 +484,4 @@ canvas.viewer:active { cursor: grabbing; }
 .sp-port-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 6px 0; }
 .sp-port-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .sp-target { width: 140px; background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 4px 6px; }
+.sp-name { width: 260px; background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 4px 6px; }
