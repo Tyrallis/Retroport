@@ -36,6 +36,7 @@ import time
 from .. import dbc as D
 from ..mpq import ClientData, write_archive
 from .creatures import CreatureError, export_display
+from .m2xform import translate
 
 PATCH_NAME = "patch-S.MPQ"
 ROOT = "Spells\\Retroport"
@@ -108,7 +109,7 @@ def plan(visual: dict) -> dict:
         for m in e["models"]:
             slot = ATTACH_SLOTS.get(m["attachment"])
             entry = {"fdid": m["fdid"], "path": m["path"], "scale": round((m["scale"] or 1) * (m["attach_scale"] or 1), 4),
-                     "from": m["attachment_name"]}
+                     "from": m["attachment_name"], "offset": [round(float(x), 4) for x in m["offset"]]}
             if slot and slot not in kit["slots"]:
                 kit["slots"][slot] = entry
             elif len(kit["specials"]) < 3:
@@ -116,9 +117,9 @@ def plan(visual: dict) -> dict:
             else:
                 dropped.append(f"{what}: no free slot for {m['path'] or m['fdid']}")
                 continue
-            if any(abs(x) > 0.01 for x in m["offset"]):
-                dropped.append(f"{(m['path'] or str(m['fdid'])).split('/')[-1]}: offset "
-                               f"{[round(x, 2) for x in m['offset']]} not carried (3.3.5 kits hang a model at its point)")
+            if any(abs(x) > 0.001 for x in m.get("rotation") or ()):
+                dropped.append(f"{(m['path'] or str(m['fdid'])).split('/')[-1]}: turn "
+                               f"{[round(x, 2) for x in m['rotation']]} not carried (its offset is)")
             if m["delay"]:
                 dropped.append(f"{(m['path'] or str(m['fdid'])).split('/')[-1]}: starts {m['delay']} s late in retail")
         for a in e.get("anims", []):
@@ -423,6 +424,38 @@ class SpellPort:
         effect_names: dict[tuple, int] = {}
         stems: set[str] = set()
 
+        moved: dict[tuple, str] = {}            # (fdid, offset) -> the .mdx path of a moved copy
+
+        def placed(entry, port_notes) -> str:
+            """The model's .mdx path as the kit hangs it: its retail offset moved into the file (a copy
+            per offset, beside the original: same textures). The kit scales the model, so the offset
+            is divided by the scale first."""
+            base = exported.get(entry["fdid"], "")
+            off = tuple(entry.get("offset") or (0.0, 0.0, 0.0))
+            if not base or not any(abs(x) > 0.001 for x in off):
+                return base
+            key = (entry["fdid"], off, entry["scale"])
+            if key in moved:
+                return moved[key]
+            folder, stem = base.rsplit("\\", 1)[0], base.rsplit("\\", 1)[1].rsplit(".", 1)[0]
+            new_stem = f"{stem}_o{len([k for k in moved if k[0] == entry['fdid']]) + 1}"
+            scale = entry["scale"] or 1.0
+            try:
+                for name in [n for n in files if n.startswith(folder + "\\" + stem)]:
+                    rest = name[len(folder) + 1 + len(stem):]
+                    if not (rest.startswith(".") or rest[:1].isdigit()):
+                        continue                    # another model's file (a longer stem in the folder)
+                    data = files[name]
+                    if rest == ".m2":
+                        data = translate(data, tuple(x / scale for x in off))
+                    files[f"{folder}\\{new_stem}{rest}"] = data
+            except ValueError as e:
+                port_notes.append(f"{(entry['path'] or str(entry['fdid'])).split('/')[-1]}: offset not carried ({e})")
+                moved[key] = base
+                return base
+            moved[key] = f"{folder}\\{new_stem}.mdx"
+            return moved[key]
+
         def model(entry, port_notes) -> int:
             fdid = entry["fdid"]
             if fdid not in exported:
@@ -441,13 +474,14 @@ class SpellPort:
                 exported[fdid] = ex.dbc_model_name
             if not exported[fdid]:
                 return 0
-            key = (fdid, entry["scale"])
+            path = placed(entry, port_notes)
+            key = (path, entry["scale"])
             if key not in effect_names:
                 eid = new("n")
                 row = [0] * NAME_FIELDS
                 row[0] = eid
-                row[1] = names.add_string(os.path.basename(exported[fdid]).rsplit(".", 1)[0])
-                row[2] = names.add_string(exported[fdid])
+                row[1] = names.add_string(path.rsplit("\\", 1)[-1].rsplit(".", 1)[0])
+                row[2] = names.add_string(path)
                 row[3], row[4], row[5], row[6] = _f(1.0), _f(entry["scale"]), _f(0.01), _f(100.0)
                 names.add_record(row)
                 effect_names[key] = eid
