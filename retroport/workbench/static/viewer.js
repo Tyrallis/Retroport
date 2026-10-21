@@ -653,6 +653,8 @@ class Viewer {
         em.acc -= Math.floor(em.acc);
         if (!n || em.list.length >= MAX_PARTICLES) continue;
         const frame = M4.mul(model, p.world[d.bone] || IDENT);
+        // the model's scale (a spell's 0.15 rift) sizes and speeds its particles as well as its mesh
+        const ms = Math.hypot(model[0], model[1], model[2]) || 1;
         const len = value(d.length, now, m, 0), wid = value(d.width, now, m, 0);
         const vr = value(d.vrange, now, m, 0), hr = value(d.hrange, now, m, 0);
         const speed = value(d.speed, now, m, 0), speedVar = value(d.speed_var, now, m, 0);
@@ -669,8 +671,8 @@ class Viewer {
           } else {                                         // a plane (and the rest): from its rectangle
             local = [d.pos[0] + rnd() * len / 2, d.pos[1] + rnd() * wid / 2, d.pos[2]];
           }
-          const v = norm(M4.rotate(frame, dir)), sp = speed * (1 + rnd() * speedVar);
-          em.list.push({p: M4.apply(frame, local), v: v.map(c => c * sp), age: 0, grav,
+          const v = norm(M4.rotate(frame, dir)), sp = speed * (1 + rnd() * speedVar) * ms;
+          em.list.push({p: M4.apply(frame, local), v: v.map(c => c * sp), age: 0, grav, s: ms,
                         life: Math.max(0.03, life + rnd() * d.life_var), r: Math.random(), r2: Math.random(),
                         spin: d.base_spin + rnd() * d.base_spin_var});
         }
@@ -696,7 +698,7 @@ class Viewer {
         const col = lifeValue(d.color, t, 3) || [1, 1, 1], a = (lifeValue(d.alpha, t, 1) || [1])[0];
         const sc = lifeValue(d.scale, t, 2) || [0.1, 0.1];
         const mul = (1 + (q.r * 2 - 1) * (d.scale_var[0] || 0)) * (tw[0] + (tw[1] - tw[0]) * q.r2);
-        const sx = Math.max(0, sc[0] * mul), sy = Math.max(0, sc[1] * mul);
+        const sx = Math.max(0, sc[0] * mul * (q.s || 1)), sy = Math.max(0, sc[1] * mul * (q.s || 1));
         const cell = Math.floor((lifeValue(d.cells, t, 1) || [0])[0]) % cells;
         const u0 = (cell % d.cols) / d.cols, v0 = Math.floor(cell / d.cols) / d.rows, u1 = u0 + 1 / d.cols, v1 = v0 + 1 / d.rows;
         const ang = q.spin + d.spin * q.age * 1000, ca = Math.cos(ang), sa = Math.sin(ang);
