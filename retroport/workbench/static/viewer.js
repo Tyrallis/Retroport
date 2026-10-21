@@ -597,11 +597,15 @@ class Viewer {
       p.weights = (m.weights || []).map(w => (sample(w, now, m.duration, m.globals, 1) || [1])[0]);
       if (p.opts.bodyOf) continue;                       // bones after its body
       const n = p.bones.length;
+      // opts.anim(t): another animation's keyframes for now ({tracks, duration, now}) - a caster's
+      // spell animations over the timeline - else the mesh's own (Stand)
+      const ov = p.opts.anim ? p.opts.anim(T) : null;
+      const bnow = ov ? ov.now : now, bdur = ov ? ov.duration : m.duration;
       for (let i = 0; i < n; i++) {
-        const b = p.bones[i];
-        const t = sample(b.t, now, m.duration, m.globals, 3) || [0, 0, 0];
-        const r = sample(b.r, now, m.duration, m.globals, 4) || [0, 0, 0, 1];
-        const s = sample(b.s, now, m.duration, m.globals, 3) || [1, 1, 1];
+        const b = p.bones[i], k = ov ? (ov.tracks[i] || {}) : b;
+        const t = sample(k.t, bnow, bdur, m.globals, 3) || [0, 0, 0];
+        const r = sample(k.r, bnow, bdur, m.globals, 4) || [0, 0, 0, 1];
+        const s = sample(k.s, bnow, bdur, m.globals, 3) || [1, 1, 1];
         const local = M4.bone(b.v, t, r, s, new Float32Array(16));
         const w = b.p >= 0 && p.world[b.p] ? M4.mul(p.world[b.p], local) : local;
         if (b.f & 0x8) {                                   // a spherical billboard: turn it to the camera

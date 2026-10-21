@@ -405,9 +405,9 @@ def bake_multitex_particles(m2: bytes, files: dict[str, bytes], tex_file: dict[i
 class Export:
     """A display's files, as the client and the mod will look for them."""
 
-    def __init__(self, stem: str):
+    def __init__(self, stem: str, root: str = ROOT):
         self.stem = stem
-        self.folder = f"{ROOT}\\{stem}"
+        self.folder = f"{root}\\{stem}"
         self.files: dict[str, bytes] = {}
         self.notes: list[str] = []
         self.variations = ["", "", ""]
@@ -428,9 +428,10 @@ class Export:
         self.files[f"{self.folder}\\{name}"] = data
 
 
-def export_display(read, row: dict, stem: str) -> Export:
-    """Every file the client needs for this display (``row`` as CreatureIndex.row gives it)."""
-    ex = Export(stem)
+def export_display(read, row: dict, stem: str, root: str = ROOT) -> Export:
+    """Every file the client needs for this display (``row`` as CreatureIndex.row gives it; a spell
+    model passes {"model": fdid} and its own ``root``)."""
+    ex = Export(stem, root)
     m2 = read(row["model"])
     if m2[:4] != b"MD21":
         raise CreatureError(f"model {row['model']} is not a chunked (MD21) model; nothing modern to port")

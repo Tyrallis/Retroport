@@ -183,7 +183,7 @@ class SpellIndex:
         events = []
         for start, end, smin, smax, emin, emax, target, kid in sorted(self.ev.get(vid, []), key=lambda e: (e[0], e[7])):
             dmin, dmax = self.kit.get(kid, (0, 0))
-            models, other = [], {}
+            models, other, anims = [], {}, []
             for t, e in self.ke.get(kid, []):
                 if t == 2 and e in self.ma:
                     a = self.ma[e]
@@ -197,11 +197,12 @@ class SpellIndex:
                     name = EFFECT_TYPES.get(t, f"type {t}")
                     if t == 6 and e in self.anim:
                         name = f"animation {self.anim[e][1]}" if self.anim[e][1] >= 0 else "animation"
+                        anims.append({"initial": self.anim[e][0], "loop": self.anim[e][1], "kit": self.anim[e][2]})
                     other[name] = other.get(name, 0) + 1
             events.append({"start": start, "end": end, "start_name": EVENTS.get(start, f"event {start}"),
                            "end_name": EVENTS.get(end, f"event {end}"), "offset": [smin, smax], "end_offset": [emin, emax],
                            "target": target, "target_name": TARGETS.get(target, f"target {target}"), "kit": kid,
-                           "kit_delay": [dmin, dmax], "models": models,
+                           "kit_delay": [dmin, dmax], "models": models, "anims": anims,
                            "other": [f"{n} ×{c}" if c > 1 else n for n, c in sorted(other.items())]})
         missiles = []
         for name_id, att, dest, co, io, fl in self.ms.get(s[0], []):
@@ -254,6 +255,8 @@ class Spells:
         self._lock = threading.Lock()
         self._meshes: dict = {}
         self.state = "idle"
+        from .spellport import SpellPort
+        self.port = SpellPort(wb, self)
 
     def source(self):
         return self.wb.creatures.source()
@@ -293,6 +296,20 @@ class Spells:
         return self._meshes[k]
 
     def stage(self) -> dict:
-        """The caster and the target the preview casts with."""
+        """The caster and the target the preview casts with (when no character body is available)."""
         cr = self.wb.creatures
         return {"caster": cr.preview(CASTER_DISPLAY), "target": cr.preview(TARGET_DISPLAY)}
+
+    def body_anims(self, race: str, sex: int, ids: list[int]) -> dict:
+        """A character body's bone keyframes for the animations a spell plays on its caster
+        (the body itself: /api/body)."""
+        wb = self.wb
+        if wb.bodies is None:
+            raise LookupError("the character stand-in needs BfA's bodies (Settings: BfA from wago.tools)")
+        _item, bfa = wb.race_ids("bfa", race)
+        b = wb.bodies
+        k = ("anims", bfa, sex, tuple(sorted(set(ids))))
+        if k not in self._meshes:
+            rrow = dict(b.table("ChrRaces"))[bfa]
+            self._meshes[k] = {str(a): v for a, v in M.anim_tracks(b.src.read, b._model_fdid(rrow, sex), sorted(set(ids))).items()}
+        return self._meshes[k]

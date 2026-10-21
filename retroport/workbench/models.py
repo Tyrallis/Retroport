@@ -374,6 +374,56 @@ def model_anims(m, seq, ext, textures: dict[int, int]) -> dict:
     return {"uvanims": uv, "colors": colors, "weights": weights, "particles": particles}
 
 
+def seq_index(sequences: list[dict], anim_id: int) -> int | None:
+    """The sequence animation ``anim_id`` (first variation) plays, through any alias."""
+    for k, s in enumerate(sequences):
+        if s.get("id") == anim_id and s.get("variation_index", 0) == 0:
+            seen = set()
+            while s.get("flags", 0) & SEQ_ALIAS and s.get("alias_next", k) < len(sequences) and k not in seen:
+                seen.add(k)
+                k = s["alias_next"]
+                s = sequences[k]
+            return k
+    return None
+
+
+def anim_tracks(read, fdid: int, anim_ids: list[int]) -> dict:
+    """A model's bone keyframes for each animation asked for that it has (a character's spell
+    casting): {id: {"duration", "bones": [{t, r, s} per bone]}} - bones in the order ``mesh`` gives."""
+    from wotlkconv.m2.model import parse_m2
+    m = parse_m2(read(fdid), f"model {fdid}")
+    bones, sequences, refs, chunk = m.bones, m.sequences, m.anim_file_ids, "AFM2"
+    skel_id = getattr(m, "skeleton_file_id", 0)
+    if skel_id:
+        from wotlkconv.m2.skel import load_skeleton_chain
+
+        def loader(f):
+            try:
+                return read(f)
+            except Exception:
+                return None
+        sk = load_skeleton_chain(loader, skel_id)
+        if sk is not None and sk.bones:
+            bones, sequences, refs, chunk = sk.bones, sk.sequences or sequences, sk.anim_file_ids or refs, "AFSB"
+    out = {}
+    for aid in anim_ids:
+        seq = seq_index(sequences, aid)
+        if seq is None:
+            continue
+        s = sequences[seq]
+        ext = None if s.get("flags", 0) & 0x20 else _anim_file(read, refs, s["id"], s.get("variation_index", 0), chunk)
+        tracks = []
+        for b in bones:
+            e = {}
+            for key, name, kind in (("t", "translation", "vec3"), ("r", "rotation", "quat16"), ("s", "scale", "vec3")):
+                tr = _track(b[name], seq, ext, b[name].kind)
+                if tr:
+                    e[key] = tr
+            tracks.append(e)
+        out[aid] = {"duration": s["duration"], "bones": tracks}
+    return out
+
+
 def skeleton(read, m) -> dict:
     """The model's bones (its own, or its ``.skel``'s) with the Stand animation's keyframes."""
     bones, attachments, sequences, refs, loops, chunk = m.bones, m.attachments, m.sequences, m.anim_file_ids, \

@@ -185,6 +185,23 @@ class Restart:
                 self.say(f"stopping the worldserver (pid {p['pid']}): it saves the players first")
                 self.say(f"worldserver: {stop_console_app(p['pid'])}")
 
+    def stop_client(self) -> None:
+        """The client only (a spell visual needs no server restart)."""
+        for p in processes(CLIENT_EXES):
+            if self._ours(p, self.client_dir):
+                self.client = self.client or p
+                self.say(f"closing the client ({p['name']}, pid {p['pid']})")
+                self.say(f"client: {close_window_app(p['pid'])}")
+
+    def start_client(self) -> bool:
+        exe = (self.client or {}).get("exe") or find_client(self.client_dir)
+        if not exe:
+            self.say("no client .exe found in the client folder: start it yourself")
+            return False
+        start((self.client or {}).get("cmd") or [exe], os.path.dirname(exe), console=False)
+        self.say(f"started {exe}")
+        return True
+
     def start_all(self) -> list[str]:
         started = []
         exe = (self.server or {}).get("exe") or find_worldserver(self.world_conf)

@@ -118,6 +118,66 @@ function spAdd(v, row, mesh, stage) {
   }});
 }
 
+// ---------------------------------------------------------------------------- the characters
+// The race and sex picked under the preview, undressed, as caster and target. The caster plays what
+// the spell's events on it ask for (an initial animation once, then its loop until the event ends);
+// a spell that names none gets the ready-spell loop while casting and the cast at its end.
+const SP_ANIM_NAMES = {51: "ReadySpellDirected", 52: "ReadySpellOmni", 53: "SpellCastDirected", 54: "SpellCastOmni",
+                       76: "ChannelCastDirected", 77: "ChannelCastOmni"};
+async function spPeople(vis, timing) {
+  const race = PV.race, sex = PV.sex;
+  const body = await bodyOf(race, sex);
+  const outfit = {pieces: [], dress_order: [], item_geosets: {}, problems: []};
+  const skin = await compositeSkin(body, outfit, "bfa");
+  const worn = wornGeosets(body, outfit);
+  const types = {1: skin};
+  if (body.hair) types[6] = `/tex/bfa/${body.hair}.png`;
+  if (body.skin_extra) types[8] = `/tex/bfa/${body.skin_extra}.png`;
+
+  // what the caster plays: [{from, to, id, once}] (to is null for "as long as the animation lasts")
+  const at = spMoments(timing, vis.missiles.length > 0);
+  const when = e => at[e] ?? at[3];
+  const wanted = [];
+  let precast = false, cast = false;
+  for (const e of vis.events) {
+    if (e.target !== 1 || !e.anims || !e.anims.length) continue;
+    const a = e.anims[0], from = when(e.start) + (e.offset[0] || 0);
+    const to = e.end === 13 ? null : when(e.end) + (e.end_offset[0] || 0);
+    if (a.initial >= 0) wanted.push({from, to: a.loop >= 0 ? null : to, id: a.initial, once: true, then: a.loop >= 0 ? {id: a.loop, to} : null});
+    else if (a.loop >= 0) wanted.push({from, to, id: a.loop, once: false});
+    if (e.start === 1) precast = true;
+    if (e.start === 3) cast = true;
+  }
+  if (!precast && timing.cast > 0) wanted.push({from: 0, to: timing.cast, id: 51, once: false});
+  if (!cast) wanted.push({from: timing.cast || 0, to: null, id: 53, once: true});
+  const ids = [...new Set(wanted.flatMap(w => [w.id, ...(w.then ? [w.then.id] : [])]))];
+  const anims = ids.length ? await api("/api/spell/body-anims", {race, sex, ids: ids.join(",")}) : {};
+  const segs = [];
+  for (const w of wanted) {
+    const a = anims[w.id];
+    if (!a) continue;
+    const end = w.to ?? w.from + a.duration;
+    segs.push({from: w.from, to: Math.max(end, w.from + 1), a, once: w.once});
+    if (w.then && anims[w.then.id]) {
+      const b = anims[w.then.id], start = w.from + a.duration;
+      const stop = w.then.to ?? start + b.duration;
+      if (stop > start) segs.push({from: start, to: stop, a: b, once: false});
+    }
+  }
+  segs.sort((x, y) => x.from - y.from);
+  const anim = T => {
+    let s = null;
+    for (const x of segs) if (x.from <= T && T < x.to) s = x;
+    if (!s) return null;
+    const dt = T - s.from;
+    return {tracks: s.a.bones, duration: s.a.duration, now: s.once ? Math.min(dt, s.a.duration - 1) : dt};
+  };
+  const played = ids.filter(i => anims[i]).map(i => SP_ANIM_NAMES[i] || `animation ${i}`);
+  const missing = ids.filter(i => !anims[i]);
+  return {body, types, visible: id => shows(worn, id, true), anim, played, missing,
+          who: `${body.name} ${sex ? "female" : "male"}`};
+}
+
 // ---------------------------------------------------------------------------- the drawer
 async function spStage() {
   if (!SP.stage) SP.stage = api("/api/spell/stage").catch(e => { SP.stage = null; throw e; });
@@ -127,12 +187,12 @@ async function spStage() {
 async function spOpen(id) {
   let d;
   try { d = await api("/api/spell", {id}); } catch (e) { toast(e.message); return; }
+  // the race choice lists your client's races (loaded with the item views, else here)
+  if (!PV.races.length) { try { PV.races = await api("/api/races"); } catch (e) { /* the default list */ } }
   SP.open = id;
   $$("#sp-grid .card.sel").forEach(c => c.classList.remove("sel"));
   $$(`#sp-grid .card[data-spell="${id}"]`).forEach(c => c.classList.add("sel"));
-  const pb = previewBox("spell");
-  const picker = pb.controls.querySelector(".pv-pick");
-  if (picker) picker.hidden = true;
+  const pb = previewBox("spell");                        // its race and sex choice picks the stand-ins
   const t = d.timing;
   const secs = ms => `${(ms / 1000).toFixed(ms % 1000 ? 2 : 0)} s`;
   const title = el("h2", {class: "d-title"}, d.name);
@@ -164,7 +224,8 @@ async function spOpen(id) {
     visual = vis;
     pb.info.textContent = "Loading the stand-ins and the spell's models…";
     try {
-      const stage = await spStage();
+      const people = await spPeople(vis, d.timing).catch(e => ({problem: e.message}));
+      const stage = people.body ? null : await spStage();
       const models = [...vis.events.flatMap(e => e.models), ...vis.missiles];
       const keys = [...new Map(models.map(m => [spKey(m), m])).values()];
       const meshes = new Map(), problems = [];
@@ -174,7 +235,13 @@ async function spOpen(id) {
       }));
       if (token !== PV.token) return;
       v.clear();
-      const parts = {
+      const parts = people.body ? {
+        // the character you picked casts, playing the animations the spell's events ask for, at another
+        caster: v.add(people.body.mesh, {texUrl: texUrl("bfa"), types: people.types, visible: people.visible,
+                                         place: () => spPlaceAt([0, 0, 0], 0), anim: people.anim}),
+        target: v.add(people.body.mesh, {texUrl: texUrl("bfa"), types: people.types, visible: people.visible,
+                                         place: () => spPlaceAt([SP_DIST, 0, 0], Math.PI)}),
+      } : {
         caster: v.add(stage.caster.mesh, {texUrl: texUrl(stage.caster.source), place: () => spPlaceAt([0, 0, 0], 0)}),
         target: v.add(stage.target.mesh, {texUrl: texUrl(stage.target.source), place: () => spPlaceAt([SP_DIST, 0, 0], Math.PI)}),
       };
@@ -201,7 +268,11 @@ async function spOpen(id) {
       v.rate(+speed.value);
       play.textContent = "Pause";
       pb.info.textContent = `${plural(plan.rows.length, "model")} on ${keys.length} file${keys.length === 1 ? "" : "s"} · ` +
-        `cast by a stand-in (Jaina) at a training post ${SP_DIST} yards away`;
+        (people.body ? `cast by a ${people.who} at another ${SP_DIST} yards away` +
+                       (people.played.length ? ` · plays ${people.played.join(", ")}` : "")
+                     : `cast by a stand-in (Jaina) at a training post ${SP_DIST} yards away`);
+      if (people.problem) notes(pb.info, [`No character body (${people.problem}): Jaina stands in`]);
+      if (people.missing && people.missing.length) notes(pb.info, [`The body has no animation ${people.missing.join(", ")}`]);
       notes(pb.info, problems);
       if (plan.rows.some(r => r.m.positioner)) notes(pb.info, ["Some models use a positioner (a scripted path): shown at their point"]);
       spChart(chart, plan);

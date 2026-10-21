@@ -1030,6 +1030,10 @@ def make_handler(wb: Workbench):
                     self._json(wb.creatures.set_settings(body or {}))
                 elif url.path == "/api/creatures/install":
                     self._json(wb.creatures.start_install())
+                elif url.path == "/api/spellport/ports":
+                    self._json(wb.spells.port.set_ports(body or []))
+                elif url.path == "/api/spellport/install":
+                    self._json(wb.spells.port.install(bool((body or {}).get("restart")), wb.say))
                 elif url.path == "/api/kit/run":
                     wb.run_kit((body or {}).get("action", ""), (body or {}).get("step", ""))
                     self._json(wb.kit_status())
@@ -1118,6 +1122,15 @@ def make_handler(wb: Workbench):
                 return self._json(wb.spells.model(_int(q.get("fdid")) or 0, _int(q.get("texture")) or 0))
             if path == "/api/spell/stage":
                 return self._json(wb.spells.stage())
+            if path == "/api/spell/body-anims":
+                ids = [int(x) for x in (q.get("ids") or "").split(",") if x.strip().lstrip("-").isdigit() and int(x) >= 0]
+                return self._json(wb.spells.body_anims(q.get("race", "hu"), _int(q.get("sex")) or 0, ids))
+            if path == "/api/spellport":
+                return self._json(wb.spells.port.state())
+            if path == "/api/spellport/plan":
+                return self._json(wb.spells.port.preview_plan(_int(q.get("visual")) or 0))
+            if path == "/api/spellport/client-spell":
+                return self._json(wb.spells.port.client_spell(_int(q.get("id")) or 0))
             if path == "/api/kit/log":
                 return self._json(wb.kit.log_since(_int(q.get("since")) or 0))
             cat = wb.catalog(q.get("source", ""))
