@@ -75,6 +75,12 @@ release.
 - **[WarcraftXL](https://github.com/WarcraftXL/wxl-core)** (GPL-3.0) - the 3.3.5a client extension
   framework Equip Plus and retroport's `native/wxl-*` plugins are built on.
 
+One piece of Kirazul's work is bundled, with the author's permission: the 3D viewer's live physics
+(`retroport/workbench/static/physics.wasm`, built by `retroport/workbench/physics_wasm/`) is compiled
+from Kirazul's port of the retail client's physics engine ("Domino", `physics_domino.h/.cpp`, as
+shipped in Equip Plus). It is not covered by retroport's licence: the port is Kirazul's work and the
+original engine's copyright is Blizzard's.
+
 ## Bundled in the release
 
 The release zip carries these, unchanged, each with its license file (in
