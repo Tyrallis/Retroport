@@ -1,8 +1,9 @@
 Retroport Workbench
 ===================
 
-Browse retail World of Warcraft's items and transmog sets in 3D, pick what you want, and backport
-it to your 3.3.5a (WotLK 12340) client - and to your AzerothCore or TrinityCore server.
+Bring retail World of Warcraft to your 3.3.5a (WotLK 12340) client and your AzerothCore server:
+items and transmog sets, creatures, mounts and spells, each seen in 3D first and installed in one
+click.
 
 
 Start
@@ -13,8 +14,11 @@ Start
    "More info", then "Run anyway".)
 3. The first time, Settings opens: choose your 3.3.5a client folder (the one with Wow.exe).
    Optionally your server's dbc folder too, so Install adds the new items there as well.
-4. Pick items and sets (+), look them over in the Basket, give them stats in Stats (item level,
-   classes, stats, sockets, sets...), then Backport > Install.
+4. Items: pick items and sets (+), look them over in the Basket, give them stats in Stats, then
+   Backport > Install.
+   Creatures, Mounts: add them to the page's basket, then Install creatures / Install mounts.
+   Spells: open a spell, Make a new spell (a retail look on a 3.3.5 template spell), then
+   Install new spells, and .learn <id> in game.
 
 
 What it needs
@@ -26,19 +30,25 @@ What it needs
     https://github.com/Kirazul/wow-retail-backport
     https://github.com/TheDaveCalaz/wxl-equip-plus
   If wago.tools is down, Settings can read your own retail install instead.
-- Any 3.3.5a client. Optional: the extra 3D pieces (skirts, boot shells, belt buckles, 3D capes)
-  need WarcraftXL and Equip Plus in your client (https://github.com/WarcraftXL/wxl-core); Install
-  adds them only when your client has Equip Plus. With Equip Plus 1.3.0 or newer, plumes, ribbons
-  and chains can swing (live physics, experimental): turn it on in Settings.
+- Items: any 3.3.5a client. The extra 3D pieces (skirts, boot shells, belt buckles, 3D capes) need
+  WarcraftXL and Equip Plus in your client; Install adds them only when your client has it.
+- Creatures, mounts and spells: the 64-bit WarcraftXL client (https://github.com/Tyrallis/client,
+  branch x64-port) with these mods in its Mods folder:
+    wxl.modern-m2            retail models (required)
+    wxl.equip-plus           live retail physics for items, creatures, mounts and spell models (F9)
+    wxl.retail-spellvisuals  retail spell visuals and body glows
+  Each is on https://github.com/Tyrallis/<mod name>/releases.
+- An AzerothCore server for creatures, mounts and spells (Settings: its dbc folder).
 
 
 Where it keeps things
 ---------------------
   %USERPROFILE%\.retroport\workbench.json     your settings
-  %USERPROFILE%\.retroport\workbench\         its cache, your basket, the kit's project, its log
+  %USERPROFILE%\.retroport\workbench\         its cache, your baskets and spell ports, the kit's project, its log
 
 Install backs up everything it replaces in your client and server first; Undo puts it back.
-It never runs SQL against your database: it shows the item SQL for you to apply.
+The item install shows its SQL for you to apply; the creature and mount installs can run theirs
+on the world database named in worldserver.conf.
 
 
 Not affiliated with or endorsed by Blizzard Entertainment. It ships no Blizzard assets: game data

@@ -248,17 +248,26 @@ with `--display`) or let them go (`/api/kit/let-go`), and Install waits until on
 
 ## Equip Plus
 
-Its 3D pieces need WarcraftXL with Equip Plus in the client
-(`Extensions\wxl-equip-plus\wxl-equip-plus.dll`). `KitSettings.equip_plus` is `auto` (run its
+Its 3D pieces need WarcraftXL with Equip Plus in the client: the 32-bit
+`Extensions\wxl-equip-plus\wxl-equip-plus.dll`, or the 64-bit client's
+`Mods\wxl.equip-plus\bin\x64\wxl-equip-plus.dll` (`kit._equip_plus_files` finds either; the 64-bit
+one's settings file is in its mod folder). `KitSettings.equip_plus` is `auto` (run its
 converter when the client has it), `on` or `off`; without it the kit's patch alone is installed,
 which a stock client draws.
 
-**Live physics** (Equip Plus 1.3.0, experimental): the kit ports retail's Domino engine and
+**Live physics**: the kit ports retail's Domino engine and
 documents the client-mod contract (its `references/client-extension.md` section 5); Equip Plus 1.3.0
 runs it, from `DBFilesClient\WXLEquipPlusPhysics.phy2`, which its converter (`physics_table.py`)
 writes into the Equip Plus patch from the kit's `.phys` data. So the converter Install runs must be
 1.3.0 or newer: `deps.PINNED` holds its commit, a fetched copy carries the commit it is
 (`.retroport-ref`) and is fetched again when the pin moves. The client's DLL is new enough when it names that table. The switch
 is the client's: `[Physics] Enabled` and `[Fit] RetargetPivots` / `RetargetScale` in
-`Extensions\wxl-equip-plus\WXLExtendedEquipment.ini`, which Settings changes in place
-(`Kit.set_equip_plus_options`: those keys only, a copy of the file kept the first time).
+`WXLExtendedEquipment.ini`, which Settings changes in place (`Kit.set_equip_plus_options`: those keys
+only, a copy of the file kept the first time).
+
+The 64-bit Equip Plus (1.4.0) reads two more tables, written the same way by `physics.py` (which runs
+Equip Plus's `physics_table.py` through `physics_job.py`): `WXLCreaturePhysics.phy2` in `patch-R`, from
+each ported creature's and mount's `.phys`, and `WXLSpellPhysics.phy2` in `patch-S`, from the spell
+models' (a model moved for its slot carries its offset as a shift). A retail model's older `SHOJ` joint
+chunk is upgraded to `SHJ2` on the way. The preview runs the same engine in the browser:
+`static/physics.wasm` (`physics_wasm/`), stepped after each pose by `viewer.js`.
