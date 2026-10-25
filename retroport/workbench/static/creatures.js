@@ -75,7 +75,17 @@ async function crOpen(display) {
       const p = await api("/api/creature/preview", {display: shown});
       if (token !== PV.token) return;
       v.clear();
-      v.add(p.mesh, {texUrl: texUrl(p.source)});
+      const body = v.add(p.mesh, {texUrl: texUrl(p.source), glow: p.glow});   // its state effects: outline, gradient glow
+      // the models its state kit hangs on it for good (a ghost's fog, a demon's flames)
+      for (const s of p.state_models || []) {
+        try {
+          const m = (await api("/api/spell/model", {fdid: s.fdid, texture: 0})).mesh;
+          if (token !== PV.token) return;
+          v.add(m, {texUrl: texUrl(p.source), scale: s.scale, offset: s.offset,
+                    attach: s.attachment >= 0 ? {part: body, id: s.attachment} : null,
+                    place: s.attachment >= 0 ? undefined : vv => vv.modelMatrix(body)});
+        } catch (e) { /* a model that can't be read is left out */ }
+      }
       v.fit("front");
       v.canvas.hidden = false;
       v.draw();
@@ -109,6 +119,7 @@ async function crOpen(display) {
         ...kv("Scale", `${x.scale} × model ${x.model_scale}`), ...kv("Skins", x.textures.join(", ") || "none"),
         ...kv("Collision", x.collision.map(c => c.toFixed(2)).join(" × ")))),
       section("Retail creatures with this look", creatures),
+      x.creatures.length ? section("Abilities", crAbilities(x.creatures)) : null,
       x.humanoid ? el("div", {class: "warnline"}, "A dressed humanoid: retail builds its look from character models and a baked " +
         "texture, which this page does not port - it would stand there undressed.") : null,
     ].filter(Boolean));
@@ -124,6 +135,41 @@ async function crOpen(display) {
   }
   showDrawer([title, subtitle, section("Preview", pb.box), el("div", {class: "actions"}, addBtn), details]);
 }
+
+// A creature's abilities as Wowhead lists them (its spells, from Wowhead's "Abilities" tab): one
+// creature at a time, picked from the ones with this look. A spell opens in the Spells view.
+const CR_ICON = icon => `https://wow.zamimg.com/images/wow/icons/medium/${icon || "inv_misc_questionmark"}.jpg`;
+function crAbilities(creatures) {
+  const box = el("div", {class: "small"}), list = el("div", {class: "cr-abilities"});
+  const show = async ([npc, name]) => {
+    list.replaceChildren(el("div", {class: "muted"}, `Asking Wowhead for ${name}'s abilities…`));
+    let d;
+    try { d = await api("/api/wowhead/npc-abilities", {npc}); }
+    catch (e) { list.replaceChildren(el("div", {class: "warnline"}, e.message)); return; }
+    const own = d.abilities.filter(a => !a.class_spell), player = d.abilities.filter(a => a.class_spell);
+    const row = a => el("div", {class: "cr-ability"},
+      el("img", {src: CR_ICON(a.icon), alt: "", width: 28, height: 28, loading: "lazy"}),
+      el("div", {},
+        el("a", {href: "#", title: "Open in Spells", onclick: ev => { ev.preventDefault(); show_("spells"); spOpen(a.id); }}, a.name),
+        el("span", {class: "muted"}, ` #${a.id}` + (a.school.length ? ` · ${a.school.join("/")}` : "")), " ",
+        el("a", {href: `https://www.wowhead.com/spell=${a.id}`, target: "_blank", rel: "noopener", class: "muted"}, "Wowhead"),
+        a.description ? el("div", {class: "muted"}, safeHtml(a.description)) : null));
+    list.replaceChildren(...[
+      own.length || player.length ? null : el("div", {class: "muted"}, "Wowhead lists no abilities for it."),
+      ...own.map(row),
+      player.length ? el("div", {class: "muted", style: "margin-top:6px"}, "Player spells that act on it:") : null,
+      ...player.map(row),
+      el("div", {class: "muted"}, el("a", {href: `https://www.wowhead.com/npc=${npc}`, target: "_blank", rel: "noopener"},
+        `${name} on Wowhead`))].filter(Boolean));
+  };
+  const picks = creatures.slice(0, 12);
+  if (picks.length > 1) box.append(versionChips(picks.map((c, i) => ({label: c[1], title: `#${c[0]}`, on: i === 0,
+                                                                     pick: () => show(c)}))));
+  box.append(list);
+  show(picks[0]);
+  return box;
+}
+const show_ = view => (typeof show === "function" ? show(view) : null);
 
 // ---------------------------------------------------------------------------- basket and install
 async function crLoadState() {
@@ -227,10 +273,11 @@ function crRenderJob(j) {
                           el("button", {class: "copy", onclick: () => copy(`SOURCE ${r.sql.replace(/\\/g, "/")};`)}, "copy")),
     el("p", {class: "small"}, again ? `${again} Once you're in the world, spawn one:` :
       "Restart the worldserver (it reads the creature tables at start), start the client, and spawn one:"),
+    // one line each: the export notes (texture bakes and such) stay in the log above
     el("div", {class: "cr-npc"}, r.creatures.map(c => el("div", {},
-      el("button", {class: "copy", onclick: () => copy(`.npc add ${c.entry}`)}, `.npc add ${c.entry}`), ` ${c.name} `,
-      el("span", {class: "muted small"}, `display ${c.display} · model ${c.model}`),
-      ...(c.notes || []).map(n => el("div", {class: "muted small"}, n)))))].filter(Boolean));
+      el("b", {}, c.name), " ",
+      el("span", {class: "muted small"}, `display ${c.display} · model ${c.model} `),
+      el("button", {class: "copy", onclick: () => copy(`.npc add ${c.entry}`)}, `.npc add ${c.entry}`))))].filter(Boolean));
 }
 
 async function crPollJob() {

@@ -19,6 +19,7 @@
   <button class="nav" data-view="sets">Sets &amp; collections</button>
   <button class="nav" data-view="creatures">Creatures <span class="count" id="cr-count"></span></button>
   <button class="nav" data-view="spells">Spells</button>
+  <button class="nav" data-view="mounts">Mounts <span class="count" id="mt-count"></span></button>
   <button class="nav" data-view="basket">Basket <span class="count" id="basket-count">0</span></button>
   <button class="nav" data-view="stats">Stats <span class="count warn" id="stats-state" hidden></span></button>
   <button class="nav" data-view="backport">Backport <span class="count" id="kit-state"></span></button>
@@ -101,6 +102,43 @@
     <button class="more" id="cr-more" hidden>Load more</button>
   </section>
 
+  <section class="view" id="view-mounts" hidden>
+    <div class="page-head">
+      <div>
+        <h2>Mounts</h2>
+        <p class="muted">Retail's mounts, live from wago.tools: look at one with your character in the saddle, pick its
+          speeds, add it with +, then Install. Each becomes a creature (its model, skins and sounds), a mount spell (its
+          speeds, on the ground or in the air) and the item that teaches it - in your client, your server's tables and
+          your world database. It needs WarcraftXL with <b>wxl.modern-m2</b>.</p>
+      </div>
+    </div>
+    <div class="cr-top full">
+      <div class="panel" id="mt-basket"></div>
+      <div class="panel cr-install">
+        <h3>Install</h3>
+        <div id="mt-where"></div>
+        <div class="install-buttons"><button class="btn big" id="mt-go">Install mounts</button></div>
+        <div class="progress"><div class="steps" id="mt-steps"></div></div>
+        <div id="mt-result"></div>
+        <details class="cr-logbox"><summary>Log</summary><pre id="mt-log"></pre></details>
+      </div>
+      <div class="panel" id="mt-game"></div>
+    </div>
+    <div class="filters">
+      <label class="search cr-search">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="M13 13l4.5 4.5"/></svg>
+        <input id="mt-q" type="search" placeholder="Search mounts by name, item, spell or id" autocomplete="off" spellcheck="false">
+      </label>
+      <select id="mt-kind" aria-label="Kind">
+        <option value="">Every mount</option><option value="ground">Ground</option>
+        <option value="flying">Flying</option><option value="aquatic">Aquatic</option>
+      </select>
+    </div>
+    <div class="summary" id="mt-summary"></div>
+    <div class="grid items" id="mt-grid"></div>
+    <button class="more" id="mt-more" hidden>Load more</button>
+  </section>
+
   <section class="view" id="view-spells" hidden>
     <div class="page-head">
       <div>
@@ -109,7 +147,8 @@
           every model each moment of the cast puts on the caster, the target or the ground, with retail's timing.
           Make a new spell from one: it gets the retail spell's name, text, icon, timing and visual, and the mechanics of a
           3.3.5 spell you pick; Install adds it to your client and server, and <code>.learn &lt;id&gt;</code> teaches it
-          (the client needs WarcraftXL with <b>wxl.modern-m2</b>).</p>
+          (the client needs WarcraftXL with <b>wxl.modern-m2</b>, and <b>wxl.retail-spellvisuals</b> for retail
+          visuals: every model at retail's moments, offsets, turns and delays).</p>
       </div>
     </div>
     <div class="panel sp-ports" id="sp-ports"></div>
@@ -118,7 +157,11 @@
         <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="M13 13l4.5 4.5"/></svg>
         <input id="sp-q" type="search" placeholder="Search spells by name or id" autocomplete="off" spellcheck="false">
       </label>
+      <select id="sp-kind" aria-label="Kind of spell"><option value="">All spells</option></select>
+      <select id="sp-key" aria-label="Class" hidden></select>
+      <select id="sp-sub" aria-label="Specialization" hidden></select>
       <label class="check"><input type="checkbox" id="sp-models" checked> Spells with models only</label>
+      <button class="btn ghost" id="sp-bulk" hidden title="Make every spell this filter shows a new spell: its plain visual, its own name, and the first 3.3.5 spell suggested for its kind">Make all shown</button>
     </div>
     <div class="summary" id="sp-summary"></div>
     <div class="grid items" id="sp-grid"></div>
@@ -239,5 +282,6 @@
 <script src="/static/stats.js"></script>
 <script src="/static/creatures.js"></script>
 <script src="/static/spells.js"></script>
+<script src="/static/mounts.js"></script>
 </body>
 </html>

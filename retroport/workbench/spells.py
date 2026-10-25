@@ -21,7 +21,7 @@ import threading
 from . import models as M
 from .creatures import find_listfile
 
-INDEX_VERSION = 1
+INDEX_VERSION = 3
 PAGE = 60
 
 EVENTS = {1: "Precast start", 2: "Precast end", 3: "Cast", 4: "Travel start", 5: "Travel end", 6: "Impact",
@@ -97,6 +97,36 @@ class SpellIndex:
             ms.setdefault(r["SpellVisualMissileSetID"], []).append(
                 (r["SpellVisualEffectNameID"], r["Attachment"], r["DestinationAttachment"], tuple(r.get("CastOffset") or (0, 0, 0)),
                  tuple(r.get("ImpactOffset") or (0, 0, 0)), r["Flags"]))
+        # procedural effects of type 9: models scattered over the area while the kit lasts (Blizzard's
+        # falling shards) - SpellVisualKitAreaModel: model, flags, lifetime ms, per second, spacing, scale
+        say("spells: reading SpellProceduralEffect")
+        proc = {i: int(r["Value"][0]) for i, r in T("SpellProceduralEffect") if r["Type"] == 9}
+        aream = {}
+        try:
+            for i, r in T("SpellVisualKitAreaModel"):
+                aream[i] = (r["ModelFileDataID"], r["Flags"], r["LifeTime"], r["EmissionRate"], r["Spacing"],
+                            r["ModelScale"] or 1.0)
+        except Exception:
+            pass
+        # positioners: where a model with no attachment of its own hangs (its first state's position
+        # entry: an attachment point) and whether it keeps the unit's upright frame (its rotation taken
+        # from the base, 19, or from nothing) instead of turning with that point's bone (a held book)
+        say("spells: reading Positioner")
+        posi = {}
+        try:
+            PS = dict(T("PositionerState"))
+            PE = dict(T("PositionerStateEntry"))
+            for pid, p in T("Positioner"):
+                s = PS.get(p.get("FirstStateID")) or {}
+                pe = PE.get(s.get("PosEntryID")) or {}
+                re_ = PE.get(s.get("RotEntryID")) or {}
+                at = int(pe.get("SrcVal", -1)) if pe.get("SrcValType") == 1 else -1
+                rot_at = int(re_.get("SrcVal", -1)) if re_.get("SrcValType") == 1 else None
+                upright = bool(re_) and (re_.get("SrcValType") == 0 or rot_at in (19, 0, -1)) and at not in (19, 0, -1)
+                moving = bool(s.get("NextStateID")) or bool(pe.get("CurveID")) or bool(s.get("TransformMatrixID"))
+                posi[pid] = (at, upright, moving)
+        except Exception:
+            pass
         say("spells: reading SpellVisualAnim")
         anim = {i: (r["InitialAnimID"], r["LoopAnimID"], r["AnimKitID"]) for i, r in T("SpellVisualAnim")}
         say("spells: reading SpellMisc")
@@ -113,18 +143,20 @@ class SpellIndex:
         # how many models each spell shows: the search ranks spells with visuals first
         say("spells: counting each spell's models")
         kit_models = {k: {ma[e][0] for t, e in v if t == 2 and e in ma} for k, v in ke.items()}
+        kit_area = {k: {aream[proc[e]][0] for t, e in v if t == 1 and e in proc and proc[e] in aream} for k, v in ke.items()}
         counts: dict[int, int] = {}
         for sid, vis in xv.items():
             seen = set()
             for v, *_rest in vis:
                 for e in ev.get(v, []):
                     seen |= {en[n][0] for n in kit_models.get(e[7], ()) if n in en and en[n][0]}
+                    seen |= {f for f in kit_area.get(e[7], ()) if f}
                 setid = sv.get(v, (0,))[0]
                 seen |= {en[m[0]][0] for m in ms.get(setid, []) if m[0] in en and en[m[0]][0]}
             if seen:
                 counts[sid] = len(seen)
         say("spells: naming models from the listfile")
-        wanted = {x[0] for x in en.values() if x[0]}
+        wanted = {x[0] for x in en.values() if x[0]} | {x[0] for x in aream.values() if x[0]}
         paths = {}
         with open(listfile, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -133,6 +165,7 @@ class SpellIndex:
                     paths[int(left)] = right.strip()
         return cls({"version": INDEX_VERSION, "build": src.build, "names": names, "xv": xv, "sv": sv, "ev": ev,
                     "kit": kit, "ke": ke, "ma": ma, "en": en, "ms": ms, "anim": anim, "misc": misc, "cast": cast,
+                    "proc": proc, "aream": aream, "posi": posi,
                     "dur": dur, "rng": rng, "counts": counts, "paths": paths, "_order": None})
 
     # -- answers --------------------------------------------------------------------------
@@ -142,13 +175,20 @@ class SpellIndex:
             self._order = sorted(self.names, key=lambda i: (-min(self.counts.get(i, 0), 1), -i))
         return self._order
 
-    def search(self, q: str, page: int, with_models: bool) -> tuple[int, list[dict]]:
+    def search(self, q: str, page: int, with_models: bool, only: set | None = None) -> tuple[int, list[dict]]:
+        hits = self.ids(q, with_models, only)
+        return len(hits), [self.row(s) for s in hits[page * PAGE:(page + 1) * PAGE]]
+
+    def ids(self, q: str, with_models: bool, only: set | None = None) -> list[int]:
+        """Every spell a search finds, in the view's order (``only``: a filter's spells)."""
         q = q.strip().lower()
         hits = []
-        if q.isdigit() and int(q) in self.names:
+        if q.isdigit() and int(q) in self.names and (only is None or int(q) in only):
             hits.append(int(q))
         terms = q.split()
         for sid in self._rows():
+            if only is not None and sid not in only:
+                continue
             if with_models and sid not in self.counts:
                 continue
             if terms and not all(t in self.names[sid].lower() for t in terms):
@@ -156,7 +196,7 @@ class SpellIndex:
             if hits and sid == hits[0]:
                 continue
             hits.append(sid)
-        return len(hits), [self.row(s) for s in hits[page * PAGE:(page + 1) * PAGE]]
+        return hits
 
     def row(self, sid: int) -> dict:
         m = self.misc.get(sid)
@@ -183,15 +223,30 @@ class SpellIndex:
         events = []
         for start, end, smin, smax, emin, emax, target, kid in sorted(self.ev.get(vid, []), key=lambda e: (e[0], e[7])):
             dmin, dmax = self.kit.get(kid, (0, 0))
-            models, other, anims = [], {}, []
+            models, other, anims, area, sounds = [], {}, [], [], []
             for t, e in self.ke.get(kid, []):
+                if t == 5 and e:
+                    sounds.append(e)
+                if t == 1 and e in self.proc and self.proc[e] in self.aream:
+                    fd, fl, life, rate, spacing, scale = self.aream[self.proc[e]]
+                    if fd:
+                        area.append({"fdid": fd, "path": self.paths.get(fd, ""), "flags": fl, "lifetime": life,
+                                     "rate": rate, "spacing": spacing, "scale": scale, "area_id": self.proc[e]})
+                        other["area models"] = other.get("area models", 0) + 1
+                        continue
                 if t == 2 and e in self.ma:
                     a = self.ma[e]
                     mdl = self._model(a[0])
                     if not mdl:
                         continue
-                    models.append(mdl | {"attach_id": e, "attachment": a[1], "attachment_name": ATTACHMENTS.get(a[1], f"point {a[1]}"),
-                                         "positioner": a[2], "offset": list(a[3]), "rotation": list(a[4]), "attach_scale": a[5],
+                    att, upright, moving = a[1], False, bool(a[2])
+                    if a[2] and a[2] in self.posi:
+                        p_at, upright, moving = self.posi[a[2]]
+                        if att == -1 and p_at >= 0:
+                            att = p_at                  # the positioner says where it hangs
+                    models.append(mdl | {"attach_id": e, "attachment": att, "attachment_name": ATTACHMENTS.get(att, f"point {att}"),
+                                         "positioner": a[2], "moving": moving, "upright": upright,
+                                         "offset": list(a[3]), "rotation": list(a[4]), "attach_scale": a[5],
                                          "delay": a[6], "anims": list(a[7]), "flags": a[8]})
                 else:
                     name = EFFECT_TYPES.get(t, f"type {t}")
@@ -202,7 +257,8 @@ class SpellIndex:
             events.append({"start": start, "end": end, "start_name": EVENTS.get(start, f"event {start}"),
                            "end_name": EVENTS.get(end, f"event {end}"), "offset": [smin, smax], "end_offset": [emin, emax],
                            "target": target, "target_name": TARGETS.get(target, f"target {target}"), "kit": kid,
-                           "kit_delay": [dmin, dmax], "models": models, "anims": anims,
+                           "kit_delay": [dmin, dmax], "models": models, "anims": anims, "area_models": area,
+                           "sounds": sounds,
                            "other": [f"{n} ×{c}" if c > 1 else n for n, c in sorted(other.items())]})
         missiles = []
         for name_id, att, dest, co, io, fl in self.ms.get(s[0], []):
@@ -254,12 +310,19 @@ class Spells:
         self._index: SpellIndex | None = None
         self._lock = threading.Lock()
         self._meshes: dict = {}
+        self._cats: dict | None = None
         self.state = "idle"
         from .spellport import SpellPort
         self.port = SpellPort(wb, self)
 
     def source(self):
         return self.wb.creatures.source()
+
+    def listfile(self) -> str:
+        """The community listfile the index named its files from."""
+        kit = self.wb.kit.cfg
+        cands = [self.wb.settings.listfile, os.path.join(getattr(kit, "work", "") or "", "listfile.csv")]
+        return find_listfile(cands, os.path.join(self.wb.settings.data_dir, "cache"), self.wb.say)
 
     def index(self) -> SpellIndex:
         with self._lock:
@@ -274,15 +337,178 @@ class Spells:
                 self.state = "ready"
             return self._index
 
-    def search(self, q: str, page: int, with_models: bool) -> dict:
+    def cats(self) -> dict:
+        """Where retail files each spell (spellcats.py), read once."""
+        from . import spellcats as SC
+        with self._lock:
+            if self._cats is None:
+                _key, src = self.source()
+                self._cats = SC.load(src, os.path.join(self.wb.settings.data_dir, "cache"), self.wb.say)
+            return self._cats
+
+    def filters(self) -> dict:
+        from . import spellcats as SC
+        return SC.menus(self.cats())
+
+    def _only(self, kind: str, key: int, sub: int) -> set | None:
+        from . import spellcats as SC
+        return SC.matching(self.cats(), kind, key, sub) if kind else None
+
+    def search(self, q: str, page: int, with_models: bool, kind: str = "", key: int = 0, sub: int = 0) -> dict:
         idx = self.index()
-        total, rows = idx.search(q, page, with_models)
-        key, _src = self.source()
-        return {"total": total, "page": page, "rows": rows, "source": key, "build": idx.build}
+        total, rows = idx.search(q, page, with_models, self._only(kind, key, sub))
+        key_, _src = self.source()
+        return {"total": total, "page": page, "rows": rows, "source": key_, "build": idx.build}
+
+    def matching_ids(self, q: str, with_models: bool, kind: str = "", key: int = 0, sub: int = 0) -> list[int]:
+        return self.index().ids(q, with_models, self._only(kind, key, sub))
 
     def detail(self, sid: int) -> dict:
         key, _src = self.source()
-        return self.index().detail(sid) | {"source": key}
+        d = self.index().detail(sid) | {"source": key}
+        # an animation kit's segments as the caster's start and loop animations, retail ids
+        try:
+            anims = self.port.anims()
+        except Exception:
+            anims = None
+        if anims:
+            for v in d["visual_list"]:
+                for e in v["events"]:
+                    for a in e.get("anims", []):
+                        if a.get("kit") and a.get("initial", -1) < 0 and a.get("loop", -1) < 0:
+                            start, loop = anims.pair(a)
+                            a["initial"] = start if start is not None else -1
+                            a["loop"] = loop if loop is not None else -1
+        # what each event's kit does to the unit's own body (Avenging Wrath's gold): the preview's glow
+        for v in d["visual_list"]:
+            for e in v["events"]:
+                try:
+                    e["glow"] = self.wb.creatures.kit_glow(e.get("kit") or 0)
+                except Exception:
+                    e["glow"] = None
+        d["timing"]["radius"] = self._radius(sid)
+        d["summons"] = self.summons(sid)
+        d["forms"] = self.forms(sid)
+        # the visual a bare 3.3.5 character gets first: retail picks a spell's visual by the caster's
+        # talents, auras and spells (PlayerCondition), and a 3.3.5 character has none of retail's
+        for v in d["visual_list"]:
+            v["baseline"] = self._bare_player_meets(v.get("player_condition") or 0)
+        d["visual_list"].sort(key=lambda x: (bool(x["difficulty"]), not x["baseline"],
+                                             bool(x["player_condition"] or x["unit_condition"]), x["id"]))
+        return d
+
+    def _radius(self, sid: int) -> float:
+        """The spell's area, in yards: the widest radius of its effects (SpellEffect -> SpellRadius),
+        0 for none. An area's ground model is sized to it (kit flag 0x8), as in game."""
+        self._effects()
+        return self._radii.get(sid, 0.0)
+
+    SUMMON_EFFECTS = (28, 56)           # SPELL_EFFECT_SUMMON, SUMMON_PET: MiscValue[0] is the creature
+
+    def _effects(self) -> None:
+        """One pass over retail's SpellEffect (and SpellShapeshift): each spell's widest radius, the
+        creatures it summons, the shapeshift forms it needs."""
+        if hasattr(self, "_radii"):
+            return
+        self._radii, self._summons, self._forms_of, self._form_rows, self._triggers = {}, {}, {}, {}, {}
+        try:
+            _key, src = self.source()
+            radius = {i: float(r.get("Radius") or 0) for i, r in src.table("SpellRadius")}
+            for _i, r in src.table("SpellEffect"):
+                sid = r["SpellID"]
+                for ix in (r.get("EffectRadiusIndex") or [])[:2]:
+                    if ix and radius.get(ix, 0) > self._radii.get(sid, 0):
+                        self._radii[sid] = radius[ix]
+                if r.get("Effect") in self.SUMMON_EFFECTS:
+                    npc = int((r.get("EffectMiscValue") or [0])[0] or 0)
+                    if npc and npc not in self._summons.setdefault(sid, []):
+                        self._summons[sid].append(npc)
+                if r.get("EffectTriggerSpell"):
+                    self._triggers.setdefault(sid, []).append(int(r["EffectTriggerSpell"]))
+            for _i, r in src.table("SpellShapeshift"):
+                mask = list(r.get("ShapeshiftMask") or [0, 0])
+                forms = [w * 32 + b + 1 for w, m in enumerate(mask[:2]) for b in range(32) if int(m or 0) >> b & 1]
+                if forms:
+                    self._forms_of[r["SpellID"]] = forms
+            self._form_rows = {i: (r.get("Name_lang") or f"form {i}", int(r.get("CreatureDisplayID") or 0))
+                               for i, r in src.table("SpellShapeshiftForm")}
+        except Exception as e:
+            self.wb.say(f"spells: SpellEffect not read ({e})")
+
+    def summons(self, sid: int) -> list[dict]:
+        """The creatures the spell summons: retail id, name, and a display of it."""
+        self._effects()
+        npcs = list(self._summons.get(sid, []))
+        # a spell that summons through a spell it casts (Summon Infernal -> Infernal Awakening)
+        for t in self._triggers.get(sid, []):
+            npcs += [n for n in self._summons.get(t, []) if n not in npcs]
+        if not npcs:
+            return []
+        if not hasattr(self, "_npc_display"):
+            self._npc_display = {}
+            try:
+                for did, lst in self.wb.creatures.index().names.items():
+                    for cid, name in lst:
+                        self._npc_display.setdefault(int(cid), (did, name))
+            except Exception:
+                pass
+        out = []
+        for npc in npcs:
+            did, name = self._npc_display.get(npc, (0, ""))
+            out.append({"npc": npc, "name": name or f"creature {npc}", "display": did})
+        # the newest creature first: retail keeps an old one beside its replacement (Demonic Tyrant)
+        out.sort(key=lambda x: (not x["display"], -x["npc"]))
+        return out
+
+    # A form's look per race, as the 3.3.5 client picks it (its druids are Night Elves and Tauren; the
+    # other races are shown with the Night Elf's): retail still has these displays, with their skins.
+    # Retail's own form display (SpellShapeshiftForm) is a newer race's (a Haranir bear) and gets its
+    # skin from character customization, which this preview doesn't have.
+    FORM_DISPLAYS = {1: {"ni": 892, "ta": 8571}, 2: {"*": 864}, 3: {"*": 632}, 4: {"*": 2428},
+                     5: {"ni": 2281, "ta": 2289}, 8: {"ni": 2281, "ta": 2289}, 29: {"ni": 20857, "ta": 20872},
+                     27: {"ni": 20857, "ta": 20872}, 31: {"ni": 15374, "ta": 15375}}
+
+    def forms(self, sid: int) -> list[dict]:
+        """The shapeshift forms the spell needs (SpellShapeshift): id, name, a display per race
+        (``displays``: race key or "*" -> display) and retail's own (``display``)."""
+        self._effects()
+        out = []
+        for f in self._forms_of.get(sid, []):
+            name, own = self._form_rows.get(f, (f"form {f}", 0))
+            per = self.FORM_DISPLAYS.get(f) or ({"*": own} if own else {})
+            if "*" not in per and per:
+                per = {**per, "*": per.get("ni") or next(iter(per.values()))}
+            out.append({"form": f, "name": name, "display": own, "displays": per})
+        return out
+
+    # PlayerCondition lists and the logic field over each: a 3.3.5 character holds none of them
+    _HELD = (("SpellID", "SpellLogic"), ("AuraSpellID", "AuraSpellLogic"), ("TraitNodeEntryID", "TraitNodeEntryLogic"))
+
+    def _bare_player_meets(self, cond: int) -> bool:
+        """Whether a character with none of retail's spells, auras or talents meets PlayerCondition
+        ``cond`` (0: no condition). Each logic field: the low bits the operator (1 all, 2 any), bit
+        16 + i turning the i-th term around. Other requirements in the row are not judged."""
+        if not cond:
+            return True
+        if not hasattr(self, "_pc"):
+            try:
+                _key, src = self.source()
+                self._pc = dict(src.table("PlayerCondition"))
+            except Exception:
+                self._pc = {}
+        row = self._pc.get(cond)
+        if not row:
+            return False
+        for list_name, logic_name in self._HELD:
+            ids = [x for x in (row.get(list_name) or []) if x]
+            if not ids:
+                continue
+            logic = int(row.get(logic_name) or 0)
+            terms = [bool(logic >> (16 + i) & 1) for i in range(len(ids))]   # held: no; turned around: yes
+            ok = any(terms) if logic & 0xFFFF == 2 else all(terms)
+            if not ok:
+                return False
+        return True
 
     def model(self, fdid: int, texture: int = 0) -> dict:
         """One spell model as the viewer's mesh (its Stand - for a spell model, its one animation)."""
@@ -295,10 +521,41 @@ class Spells:
             self._meshes[k] = {"mesh": M.mesh(src.read, fdid, tex), "source": key}
         return self._meshes[k]
 
+    def model_anims(self, fdid: int, ids: list[int]) -> dict:
+        """A spell model's keyframes for the animations asked for that it has: its intro (Stand), its
+        loop (Hold), its outro (Decay), or the ones its kit names."""
+        k = ("model-anims", fdid, tuple(sorted(set(ids))))
+        if k not in self._meshes:
+            _key, src = self.source()
+            self._meshes[k] = {str(a): v for a, v in M.anim_tracks(src.read, fdid, sorted(set(ids))).items()}
+        return self._meshes[k]
+
     def stage(self) -> dict:
         """The caster and the target the preview casts with (when no character body is available)."""
         cr = self.wb.creatures
         return {"caster": cr.preview(CASTER_DISPLAY), "target": cr.preview(TARGET_DISPLAY)}
+
+    def _game_anims(self, folder: str, sex: int) -> set[int] | None:
+        """The animation ids your client's own character model of a race has (the WoD models carry
+        retail's ids up to 808): what decides, in game, which animation a fallback lands on. None
+        when the client has no such file."""
+        import struct
+        from ..mpq import ClientData
+        k = ("game-anims", folder, sex)
+        if k not in self._meshes:
+            ids = None
+            try:
+                sexed = "Female" if sex else "Male"
+                data = ClientData(self.wb.settings.client).read(f"Character\\{folder}\\{sexed}\\{folder}{sexed}.m2")
+                base = 8 if data[:4] == b"MD21" else 0
+                n, o = struct.unpack_from("<II", data, base + 0x1C)
+                ver = struct.unpack_from("<I", data, base + 4)[0]
+                stride = 0x40 if ver >= 264 else 0x44
+                ids = {struct.unpack_from("<H", data, base + o + i * stride)[0] for i in range(n)}
+            except Exception:
+                ids = None
+            self._meshes[k] = ids
+        return self._meshes[k]
 
     def body_anims(self, race: str, sex: int, ids: list[int]) -> dict:
         """A character body's bone keyframes for the animations a spell plays on its caster
@@ -311,5 +568,32 @@ class Spells:
         k = ("anims", bfa, sex, tuple(sorted(set(ids))))
         if k not in self._meshes:
             rrow = dict(b.table("ChrRaces"))[bfa]
-            self._meshes[k] = {str(a): v for a, v in M.anim_tracks(b.src.read, b._model_fdid(rrow, sex), sorted(set(ids))).items()}
+            # an id the body lacks (retail's newer ones) plays what retail falls back to, as the game does
+            try:
+                data = self.port.anims().data
+            except Exception:
+                data = {}
+            chains = {}
+            for a in set(ids):
+                chain, x = [a], a
+                while x in data and data[x]["Fallback"] not in chain and len(chain) < 12:
+                    x = data[x]["Fallback"]
+                    chain.append(x)
+                chains[a] = chain
+            # what your game plays: the first id down the chain your client's own model has (with
+            # WoD character models off, the install already stepped below 3.3.5's 505)
+            game = self._game_anims(rrow.get("ClientFileString") or "", sex)
+            wod = self.port.options().get("wod_models", True)
+            if game is not None:
+                for a, chain in chains.items():
+                    keep = [x for x in chain if x in game and (wod or x <= 505)]
+                    chains[a] = keep + [x for x in chain if x not in keep]
+            want = sorted({x for c in chains.values() for x in c})
+            got = M.anim_tracks(b.src.read, b._model_fdid(rrow, sex), want)
+            out = {}
+            for a, chain in chains.items():
+                hit = next((x for x in chain if x in got and (x != 0 or a == 0)), None)
+                if hit is not None:
+                    out[str(a)] = got[hit]
+            self._meshes[k] = out
         return self._meshes[k]

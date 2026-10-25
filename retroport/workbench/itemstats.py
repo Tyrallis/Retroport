@@ -81,9 +81,20 @@ def save(data_dir: str, edits: dict) -> None:
              "sets": list(edits.get("sets") or [])}
     os.makedirs(data_dir, exist_ok=True)
     path = os.path.join(data_dir, "item-stats.json")
-    with open(path + ".part", "w", encoding="utf-8") as fh:
-        json.dump(clean, fh, indent=1)
-    os.replace(path + ".part", path)
+    # the page saves as you type: two saves at once must not share the temporary file, and Windows
+    # refuses a replace while another reader has the file open for a moment - try again briefly
+    with _lock:
+        with open(path + ".part", "w", encoding="utf-8") as fh:
+            json.dump(clean, fh, indent=1)
+        for attempt in range(20):
+            try:
+                os.replace(path + ".part", path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                import time
+                time.sleep(0.05)
 
 
 def effective(edits: dict, display, field: str, default=None):
@@ -100,7 +111,7 @@ def touched(edits: dict, display) -> bool:
     """Whether a piece has anything to write (otherwise it stays the kit's cosmetic copy)."""
     p = (edits.get("pieces") or {}).get(str(display), {})
     fields = ("ilvl", "req", "quality", "classes", "armor_type", "bonding")
-    return bool(p.get("stats") or p.get("armor") or p.get("dmg_max") or any(effective(edits, display, f) not in (None, "")
+    return bool((p.get("heirloom") or {}).get("on") or p.get("stats") or p.get("armor") or p.get("dmg_max") or any(effective(edits, display, f) not in (None, "")
                                                                             for f in fields))
 
 
@@ -149,7 +160,8 @@ LIMITS = {"Quality": (0, 7), "ItemLevel": (0, 65535), "RequiredLevel": (0, 255),
           "AllowableClass": INT32, "subclass": (0, 255), "Material": (-128, 127), "armor": UINT32, "block": UINT32,
           "MaxDurability": (0, 65535), "SellPrice": UINT32, "BuyPrice": (0, INT32[1]), "dmg_min1": (0, INT32[1]),
           "dmg_max1": (0, INT32[1]), "dmg_type1": (0, 255), "delay": (0, 65535), "ammo_type": (0, 255),
-          "maxcount": INT32, "socketBonus": INT32, "itemset": UINT32,
+          "maxcount": INT32, "socketBonus": INT32, "itemset": UINT32, "Flags": UINT32,
+          "ScalingStatDistribution": (-32768, 32767), "ScalingStatValue": UINT32,
           **{f"stat_type{k}": (0, 255) for k in range(1, 11)}, **{f"stat_value{k}": INT32 for k in range(1, 11)},
           **{f"socketColor_{k}": (-128, 127) for k in range(1, 4)}, **{f"socketContent_{k}": INT32 for k in range(1, 4)}}
 
@@ -160,7 +172,8 @@ def column_value(col: str, v):
     return min(max(v, lo), hi) if lo is not None and isinstance(v, int) and not isinstance(v, bool) else v
 
 
-def updates(edits: dict, ids: dict, kit: dict[int, dict], set_ids: dict, names: dict | None = None) -> list[str]:
+def updates(edits: dict, ids: dict, kit: dict[int, dict], set_ids: dict, names: dict | None = None,
+            scalings: dict | None = None) -> list[str]:
     """One UPDATE per touched piece (the kit's row stays as it wrote it otherwise). ``names``: the name
     each look has in the workbench (the item the basket chose): the kit names a look after the first
     retail item of it, which may be another one that shares it - a piece named otherwise gets the
@@ -221,12 +234,22 @@ def updates(edits: dict, ids: dict, kit: dict[int, dict], set_ids: dict, names: 
         set_["itemset"] = in_set or 0
         if p.get("description") is not None:
             set_["description"] = _q(p.get("description") or "")
+        sc = (scalings or {}).get(display)
+        if sc:
+            # an heirloom: its stats come from its distribution at the wearer's level, none of its own;
+            # Heirloom quality, bound to the account
+            set_["ScalingStatDistribution"], set_["ScalingStatValue"] = sc["id"], sc["mask"]
+            for k in range(10):
+                set_[f"stat_type{k + 1}"], set_[f"stat_value{k + 1}"] = 0, 0
+            set_["Quality"], set_["bonding"], set_["RequiredLevel"] = 7, 1, 1     # worn from level 1, as Blizzard's
+            set_["Flags"] = (int(row.get("Flags") or 0) | BOA_FLAG) & 0xFFFFFFFF
         out.append("UPDATE `item_template` SET " + ", ".join(f"`{k}` = {column_value(k, v)}" for k, v in set_.items()) +
                    f" WHERE `entry` = {int(entry)};")
     return out
 
 
-def write_sql(work: str, edits: dict, set_ids: dict, names: dict | None = None) -> str | None:
+def write_sql(work: str, edits: dict, set_ids: dict, names: dict | None = None,
+              scalings: dict | None = None) -> str | None:
     """``<work>/out/sql/retroport-items.sql``: the kit's item SQL, then the Stats step's UPDATEs (and
     the workbench's name for each look the kit named after another item - see ``updates``)."""
     kit_path = os.path.join(work, "out", "sql", "item_template.sql")
@@ -234,7 +257,7 @@ def write_sql(work: str, edits: dict, set_ids: dict, names: dict | None = None) 
     if not os.path.isfile(kit_path):
         return None
     text = open(kit_path, encoding="utf-8").read()
-    lines = updates(edits, ids, kit_items(text), set_ids, names)
+    lines = updates(edits, ids, kit_items(text), set_ids, names, scalings)
     path = os.path.join(work, "out", "sql", "retroport-items.sql")
     with open(path + ".part", "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text.rstrip() + "\n\n-- Retroport Workbench, the Stats step: levels, stats, armor, damage, sockets, "
@@ -427,3 +450,138 @@ def _json(path: str, default):
             return json.load(fh)
     except (OSError, ValueError):
         return default
+
+
+# -- heirlooms: stats that grow with the wearer's level --------------------------------------------
+# A piece with "heirloom" on gets a ScalingStatDistribution row (its stats as shares of a budget, up
+# to a max level) and item_template.ScalingStatDistribution/ScalingStatValue: the client and the
+# server work its stats out from ScalingStatValues.dbc at the wearer's level (AzerothCore:
+# value = Bonus * budget(level) / 10000). Its stats on the page are what it has at its max level.
+SCALING_ID_START = 3000                     # the client's own distributions end in the hundreds
+SSD_FIELDS, SSV_FIELDS = 22, 24
+BOA_FLAG = 0x08000000                       # ITEM_FLAG_IS_BOUND_TO_ACCOUNT
+# ScalingStatValues columns (3.3.5: id, level, then these) and the ScalingStatValue bit naming each
+SSV_COLUMNS = ["ShoulderBudget", "TrinketBudget", "WeaponBudget1H", "RangedBudget", "ClothShoulderArmor",
+               "LeatherShoulderArmor", "MailShoulderArmor", "PlateShoulderArmor", "WeaponDPS1H", "WeaponDPS2H",
+               "SpellcasterDPS1H", "SpellcasterDPS2H", "RangedDPS", "WandDPS", "SpellPower", "PrimaryBudget",
+               "TertiaryBudget", "ClothCloakArmor", "ClothChestArmor", "LeatherChestArmor", "MailChestArmor",
+               "PlateChestArmor"]
+BUDGET_BITS = {0x1: "ShoulderBudget", 0x2: "TrinketBudget", 0x4: "WeaponBudget1H", 0x8: "PrimaryBudget",
+               0x10: "RangedBudget", 0x40000: "TertiaryBudget"}
+SHOULDER_ARMOR = {1: 0x20, 2: 0x40, 3: 0x80, 4: 0x100}
+CHEST_ARMOR = {1: 0x100000, 2: 0x200000, 3: 0x400000, 4: 0x800000}
+CASTER_ROLES = ("caster", "healer")
+
+
+def scaling_mask(inv: int, cls: int, sub: int, armor_type: int | None, role: str | None) -> int:
+    """The ScalingStatValue a piece of this slot and kind gets, as Blizzard's heirlooms have them:
+    the budget its stats scale with, and its armor or weapon damage. (3.3.5 has armor columns for
+    shoulders, chests and cloaks only: other slots keep the armor the item has.)"""
+    at = int(armor_type or sub or 0)
+    caster = (role or "") in CASTER_ROLES
+    if cls == 2:                                        # weapons
+        if sub == 19:
+            return 0x10 | 0x4000                          # wand
+        if sub in (2, 3, 18, 16) or inv in (15, 25, 26):
+            return 0x10 | 0x2000                          # bow, gun, crossbow, thrown
+        two_hand = inv == 17
+        if caster:
+            return 0x8 | (0x1000 if two_hand else 0x800) | 0x8000
+        return (0x8 | 0x400) if two_hand else (0x4 | 0x200)
+    if inv == 3:
+        return 0x1 | SHOULDER_ARMOR.get(at, 0)
+    if inv in (5, 20):
+        return 0x8 | CHEST_ARMOR.get(at, 0)
+    if inv == 16:
+        return 0x8 | 0x80000
+    if inv == 12:
+        return 0x2
+    return 0x8
+
+
+def budget_column(mask: int) -> str:
+    for bit, name in BUDGET_BITS.items():
+        if mask & bit:
+            return name
+    return "PrimaryBudget"
+
+
+def scaling_values(client_dir: str) -> dict[int, dict]:
+    """The client's ScalingStatValues: level -> {column: value}."""
+    from ..dbc import DBCFile
+    from ..mpq import ClientData
+    cd = ClientData(client_dir)
+    try:
+        t = DBCFile.from_bytes(cd.read("DBFilesClient\\ScalingStatValues.dbc"))
+    finally:
+        cd.close()
+    if t.field_count != SSV_FIELDS:
+        raise ValueError(f"ScalingStatValues.dbc has {t.field_count} fields, not 3.3.5a's {SSV_FIELDS}")
+    return {r[1]: dict(zip(SSV_COLUMNS, r[2:])) for r in t.records}
+
+
+def scaling_ids(data_dir: str, keys: list[str]) -> dict[str, int]:
+    """Each heirloom piece's ScalingStatDistribution id, kept per piece."""
+    path = os.path.join(data_dir, "item-scaling-ids.json")
+    with _lock:
+        known = _json(path, {})
+        nxt = max([SCALING_ID_START - 1, *known.values()]) + 1
+        for k in keys:
+            if k not in known:
+                known[k], nxt = nxt, nxt + 1
+        with open(path + ".part", "w", encoding="utf-8") as fh:
+            json.dump(known, fh, indent=1)
+        os.replace(path + ".part", path)
+        return known
+
+
+HEIRLOOM_QUALITY = 7
+
+
+def heirloom_pieces(edits: dict, displays=None) -> list[str]:
+    """The heirloom pieces: those with their own box ticked, and every piece (``displays``, the kit's
+    looks) when Heirloom is every piece's quality."""
+    own = [d for d, p in (edits.get("pieces") or {}).items() if (p.get("heirloom") or {}).get("on")]
+    if str((edits.get("global") or {}).get("quality")) == str(HEIRLOOM_QUALITY) and displays is not None:
+        return sorted({*own, *(str(d) for d in displays)})
+    return own
+
+
+def scaling_rows(edits: dict, ids: dict, kit: dict[int, dict], ssv: dict[int, dict], sids: dict) -> dict[str, dict]:
+    """retail display -> {id, mask, max, stats [(stat, bonus)]} for every heirloom piece the kit built."""
+    out = {}
+    for display in heirloom_pieces(edits, (ids.get("item") or {}).keys()):
+        entry = (ids.get("item") or {}).get(display) or (ids.get("item") or {}).get(int(display) if display.isdigit() else display)
+        row = kit.get(int(entry)) if entry else None
+        sid = sids.get(display)
+        if row is None or not sid:
+            continue
+        p = (edits.get("pieces") or {}).get(display, {})
+        h = p.get("heirloom") or {}
+        top = max(1, min(int(h.get("max") or (edits.get("global") or {}).get("heirloom_max") or 80), 80))
+        mask = int(h.get("mask") or 0) or scaling_mask(row.get("InventoryType", 0), row.get("class", 0), row.get("subclass", 0),
+                                                       effective(edits, display, "armor_type"),
+                                                       effective(edits, display, "profile") or h.get("role"))
+        budget = (ssv.get(top) or {}).get(budget_column(mask)) or 0
+        stats = []
+        for t, v in (p.get("stats") or [])[:10]:
+            t, v = int(t), int(v)
+            if t in STATS and v and budget:
+                stats.append((t, max(1, round(v * 10000 / budget))))
+        out[display] = {"id": sid, "mask": mask, "max": top, "stats": stats}
+    return out
+
+
+def ssd_dbc(base: bytes, rows: list[dict], owned: set[int]) -> bytes:
+    """``base`` (a ScalingStatDistribution.dbc) with ``rows`` in it - ours from before replaced."""
+    from ..dbc import DBCFile
+    dbc = DBCFile.from_bytes(base)
+    if dbc.field_count != SSD_FIELDS:
+        raise ValueError(f"ScalingStatDistribution.dbc has {dbc.field_count} fields, not 3.3.5a's {SSD_FIELDS}")
+    mine = {x["id"] for x in rows}
+    dbc.records = [r for r in dbc.records if r[0] not in owned and r[0] not in mine]
+    for x in rows:
+        stats = (x["stats"] + [(-1, 0)] * 10)[:10]
+        dbc.records.append([x["id"]] + [t & 0xFFFFFFFF for t, _b in stats] + [b for _t, b in stats] + [x["max"]])
+    dbc.records.sort(key=lambda r: r[0])
+    return dbc.to_bytes()

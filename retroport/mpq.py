@@ -117,9 +117,15 @@ class MPQ:
         bt = _decrypt(self._fh.read(bt_n * 16), hash_string("(block table)", 3))
         self._hashes = [struct.unpack_from("<IIHHI", ht, i * 16) for i in range(ht_n)]
         self._blocks = [struct.unpack_from("<IIII", bt, i * 16) for i in range(bt_n)]
+        # the file is opened again for each read: a reader kept around (the workbench keeps several)
+        # must not hold the archive, or Windows refuses to replace it on the next install
+        self._fh.close()
+        self._fh = None
 
     def close(self) -> None:
-        self._fh.close()
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
 
     def _block(self, name: str):
         n = len(self._hashes)
@@ -145,8 +151,9 @@ class MPQ:
         if block is None:
             return None
         pos, csize, size, flags = block
-        self._fh.seek(self.base + pos)
-        raw = self._fh.read(csize)
+        with open(self.path, "rb") as fh:
+            fh.seek(self.base + pos)
+            raw = fh.read(csize)
         key = None
         if flags & _ENCRYPTED:
             key = hash_string(name.replace("/", "\\").split("\\")[-1], 3)

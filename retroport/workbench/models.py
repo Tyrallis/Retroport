@@ -464,12 +464,23 @@ def skeleton(read, m) -> dict:
             "_model_seq": m_seq, "_model_ext": ext_model}
 
 
+def _has_physics(raw: bytes) -> bool:
+    """Whether a chunked model carries retail physics (PFDC inline, or a PFID naming its .phys)."""
+    pos = 0
+    while raw[:4] != b"MD20" and pos + 8 <= len(raw):
+        if raw[pos:pos + 4] in (b"PFDC", b"PFID"):
+            return True
+        pos += 8 + struct.unpack_from("<I", raw, pos + 4)[0]
+    return False
+
+
 def mesh(read, fdid: int, textures: dict[int, int], animate: bool = True) -> dict:
     """A model (FileDataID) as the viewer's mesh, with its skeleton and Stand animation.
     ``read(fdid) -> bytes``; ``textures``: M2 texture type -> FileDataID for the replaceable ones."""
     from wotlkconv.m2.model import parse_m2
     from wotlkconv.m2.skin import parse_skin
-    m = parse_m2(read(fdid), f"model {fdid}")
+    raw = read(fdid)
+    m = parse_m2(raw, f"model {fdid}")
     if not m.skin_file_ids:
         raise ModelError(f"model {fdid} names no skin file")
     skin = parse_skin(read(m.skin_file_ids[0]), f"skin {m.skin_file_ids[0]}")
@@ -511,7 +522,7 @@ def mesh(read, fdid: int, textures: dict[int, int], animate: bool = True) -> dic
     out = {"fdid": fdid, "vertices": n, "triangles": len(skin.indices) // 3, "positions": _b64(bytes(pos)),
            "normals": _b64(bytes(nrm)), "uvs": _b64(bytes(uv)), "uvs2": _b64(bytes(uv2)), "skin": _b64(bytes(wts)),
            "indices": _b64(tri),
-           "batches": batches, "bounds": [lo, hi]}
+           "batches": batches, "bounds": [lo, hi], "physics": _has_physics(raw)}
     if animate:
         try:
             sk = skeleton(read, m)

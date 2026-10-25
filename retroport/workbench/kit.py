@@ -113,12 +113,18 @@ def python_exe() -> str:
     return exe
 
 
+WOW_EXES = ("wow.exe", "wowclient64.exe", "wow64.exe", "wowclient.exe")   # the 3.3.5 client and its 64-bit builds
+
+
 def wow_running() -> bool:
     if os.name != "nt":
         return False
     try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Wow.exe"], capture_output=True, text=True).stdout
-        return "wow.exe" in out.lower()
+        # tasklist answers in the console's code page (umlauts on a German Windows): read bytes, the
+        # image names are plain ASCII either way
+        raw = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True).stdout or b""
+        out = raw.decode("ascii", errors="replace").lower()
+        return any(f'"{n}"' in out for n in WOW_EXES)
     except OSError:
         return False
 
@@ -259,17 +265,28 @@ class Kit:
     def client_root(self) -> str:
         return os.path.dirname(os.path.normpath(self.cfg.client_data)) if self.cfg.client_data else ""
 
+    def _equip_plus_files(self) -> tuple[str, str]:
+        """Equip Plus's folder (where its WXLExtendedEquipment.ini goes) and DLL: the x64 mod
+        (Mods\\wxl.equip-plus, the recompiled client) first, else the 32-bit extension."""
+        root = self.client_root()
+        if not root:
+            return "", ""
+        mod = os.path.join(root, "Mods", "wxl.equip-plus")
+        dll = os.path.join(mod, "bin", "x64", "wxl-equip-plus.dll")
+        if os.path.isfile(dll):
+            return mod, dll
+        ext = os.path.join(root, "Extensions", "wxl-equip-plus")
+        return ext, os.path.join(ext, "wxl-equip-plus.dll")
+
     def equip_plus_installed(self) -> bool:
         """Whether the client has WarcraftXL's Equip Plus (it draws the 3D pieces a stock client can't)."""
-        root = self.client_root()
-        return bool(root) and os.path.isfile(os.path.join(root, "Extensions", "wxl-equip-plus", "wxl-equip-plus.dll"))
+        _folder, dll = self._equip_plus_files()
+        return bool(dll) and os.path.isfile(dll)
 
     def equip_plus_client(self) -> dict:
         """The client's Equip Plus: there at all, its DLL new enough for live physics (1.3.0), and
         the physics and fit options of its WXLExtendedEquipment.ini."""
-        root = self.client_root()
-        folder = os.path.join(root, "Extensions", "wxl-equip-plus") if root else ""
-        dll = os.path.join(folder, "wxl-equip-plus.dll")
+        folder, dll = self._equip_plus_files()
         out = {"installed": bool(folder) and os.path.isfile(dll), "physics": False, "ini": os.path.join(folder, INI_NAME) if folder else "",
                "options": {"physics": False, "pivots": False, "scale": False}}
         if out["installed"]:

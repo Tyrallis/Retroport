@@ -158,8 +158,24 @@ function budget(ilvl, q, group) {
   return Math.round(r[base + group] * (q <= 1 ? 0.7 : 1));
 }
 const cost = t => (SG.opts.stats[t] || [0, 0, 1])[2] || 1;
+// An heirloom's stats are filled in for its max level: as a rare item of the level a WotLK heirloom
+// matches there (187 at level 80, Blizzard's), not the piece's own item level.
+function heirloomIlvl(top) { return top >= 80 ? 187 : top <= 60 ? top + 5 : Math.round(65 + (top - 60) * 6.1); }
+// A piece is an heirloom by its own box, or by Heirloom picked as every piece's quality; its max level
+// is its own, else every piece's (80 unless set).
+const HEIRLOOM = 7;
+const allHeirloom = () => +SG.edits.global.quality === HEIRLOOM;
+function heirloomOf(p) {
+  const h = (SG.edits.pieces[p.display] || {}).heirloom || {};
+  if (!h.on && !allHeirloom()) return null;
+  return {on: true, own: !!h.on, max: Math.max(1, Math.min(+(h.max || SG.edits.global.heirloom_max) || 80, 80))};
+}
+function fillLevel(p) {
+  const h = heirloomOf(p);
+  return h ? {ilvl: heirloomIlvl(h.max), q: 3} : {ilvl: +eff(p, "ilvl", 0), q: qualityOf(p)};
+}
 function autoStats(p, k) {
-  const ilvl = +eff(p, "ilvl", 0), q = qualityOf(p), prof = PROFILES[profileOf(p)] || PROFILES.str;
+  const {ilvl, q} = fillLevel(p), prof = PROFILES[profileOf(p)] || PROFILES.str;
   const B = budget(ilvl, q, slotGroup(p.inv));
   if (!B) return [];
   const total = Math.pow(B * 1.06, 1.5);
@@ -194,7 +210,7 @@ function lookup(table, p, sub, q) {
   return null;
 }
 function autoNumbers(p) {
-  const ilvl = +eff(p, "ilvl", 0), q = qualityOf(p), sub = subOf(p), t = SG.opts.tables, out = {};
+  const {ilvl, q} = fillLevel(p), sub = subOf(p), t = SG.opts.tables, out = {};
   if (p.cls === 4) out.armor = curveAt(lookup(t.armor, p, sub, q), ilvl);
   out.durability = lookup(t.durability, p, sub, q) ?? 0;
   out.sell = curveAt(lookup(t.price, p, sub, q), ilvl);
@@ -214,7 +230,9 @@ function autoNumbers(p) {
 }
 // fill in a piece's stats and numbers by the rules (``k``: its place, to vary the secondary ratings)
 function fillPiece(p, k) {
-  if (!+eff(p, "ilvl", 0)) return false;
+  // an heirloom keeps the role its stats were filled in for: Install picks its weapon damage by it
+  if (heirloomOf(p)) own(p.display).heirloom = {...(own(p.display).heirloom || {}), role: profileOf(p)};
+  if (!fillLevel(p).ilvl || !SG.opts.tables.rpp[fillLevel(p).ilvl]) return false;
   Object.assign(own(p.display), {stats: autoStats(p, k)}, autoNumbers(p), {stats_mode: "auto"});
   return true;
 }
@@ -277,8 +295,17 @@ function renderBulk() {
       field("Item level", num({placeholder: "not set", max: 300}, g.ilvl, v => set("ilvl", v)),
             "What WotLK's numbers are filled in for"),
       field("Required level", num({placeholder: "none", max: 80}, g.req, v => set("req", v))),
-      field("Quality", sel({}, [["", "Each piece's own"], ...Object.entries(SG.opts.qualities).filter(([q]) => q <= 5)], g.quality,
-                           v => set("quality", v === "" ? "" : +v))),
+      field("Quality", sel({}, [["", "Each piece's own"], ...Object.entries(SG.opts.qualities).filter(([q]) => q <= 5 || +q === HEIRLOOM)],
+                           g.quality, v => {
+                             g.quality = v === "" ? "" : +v;
+                             // every piece an heirloom: the ones without stats get them, for the max level
+                             if (+g.quality === HEIRLOOM)
+                               SG.pieces.forEach((p, k) => { const e = own(p.display);
+                                 if (!(e.stats || []).length || e.stats_mode === "auto") fillPiece(p, k); });
+                             set("quality", g.quality);
+                           }), "Heirloom: every piece's stats grow with the wearer's level, up to the max level beside it"),
+      +g.quality === HEIRLOOM ? field("Heirloom max level", num({min: 1, max: 80, placeholder: "80"}, g.heirloom_max,
+                                     v => set("heirloom_max", v ? Math.max(1, Math.min(+v, 80)) : ""))) : null,
       field("Binding", sel({}, [["", "No binding"], ...Object.entries(SG.opts.bonding).filter(([b]) => +b)], g.bonding,
                            v => set("bonding", v === "" ? "" : +v))),
       field("Stats for", sel({}, [["", "Each piece's type"], ...Object.entries(PROFILES).map(([k, x]) => [k, x.label])], g.profile,
@@ -351,7 +378,11 @@ function renderEditor() {
     sel({title: "The role its stats are chosen for"}, Object.entries(PROFILES).map(([k, x]) => [k, x.label]), profileOf(p),
         v => ch("profile", v)),
     el("button", {class: "btn small-btn", onclick: () => {
-      if (!fillPiece(p, SG.pieces.indexOf(p))) return toast("Set the item level first (For every piece, above)");
+      if (!fillPiece(p, SG.pieces.indexOf(p))) {
+        const lv = fillLevel(p).ilvl, top = Math.max(...Object.keys(SG.opts.tables.rpp).map(Number));
+        return toast(lv ? `WotLK has no stat budget for item level ${lv} (its tables end at ${top})` :
+                          "Set the item level first (For every piece, above)");
+      }
       saveStats(); renderStats(); }}, filled ? "Fill in again" : "Fill in"),
     el("button", {class: "btn ghost small-btn", onclick: () => { SG.copyOpen = !SG.copyOpen; renderEditor(); }}, "Copy a WotLK item…")),
     el("div", {class: "muted small"}, filled ? `Filled in for ${PROFILES[profileOf(p)].label}, and kept so as the piece changes` :
@@ -391,6 +422,7 @@ function renderEditor() {
       p.cls === 4 ? row(field("Armor", num({max: UINT_MAX}, e.armor, v => { e.armor = v; manual(p.display); saveStats(); renderTooltip(); })),
                         subOf(p) === 6 ? field("Block", num({max: UINT_MAX}, e.block, v => { e.block = v; saveStats(); renderTooltip(); })) : null) : null,
       weapon),
+    heirloomSection(p),
     el("div", {class: "esec"}, el("h4", {}, "Sockets"), row(...sockets), row(field("Socket bonus", bonusSel))),
     el("div", {class: "esec"}, el("h4", {}, "More"),
       row(field("Durability", num({max: 65535}, e.durability, v => { e.durability = v; saveStats(); renderTooltip(); })),
@@ -425,25 +457,116 @@ function copyPanel(p) {
   return el("div", {class: "copy-panel"}, q, results);
 }
 
+// -- heirlooms ---------------------------------------------------------------------------------
+// A piece with heirloom on scales with the wearer's level as Blizzard's heirlooms do: its stats are
+// shares of a budget (ScalingStatDistribution), the budget and its armor or weapon damage read from
+// ScalingStatValues at the wearer's level; its stats on this page are what it has at its max level.
+// (itemstats.scaling_mask is the same choice, made again at Install.)
+const SHOULDER_ARMOR = {1: 0x20, 2: 0x40, 3: 0x80, 4: 0x100}, CHEST_ARMOR = {1: 0x100000, 2: 0x200000, 3: 0x400000, 4: 0x800000};
+const BUDGET_BITS = [[0x1, "ShoulderBudget"], [0x2, "TrinketBudget"], [0x4, "WeaponBudget1H"], [0x8, "PrimaryBudget"],
+                     [0x10, "RangedBudget"], [0x40000, "TertiaryBudget"]];
+const ARMOR_BITS = [[0x20, "ClothShoulderArmor"], [0x40, "LeatherShoulderArmor"], [0x80, "MailShoulderArmor"],
+                    [0x100, "PlateShoulderArmor"], [0x80000, "ClothCloakArmor"], [0x100000, "ClothChestArmor"],
+                    [0x200000, "LeatherChestArmor"], [0x400000, "MailChestArmor"], [0x800000, "PlateChestArmor"]];
+const DPS_BITS = [[0x200, "WeaponDPS1H"], [0x400, "WeaponDPS2H"], [0x800, "SpellcasterDPS1H"], [0x1000, "SpellcasterDPS2H"],
+                  [0x2000, "RangedDPS"], [0x4000, "WandDPS"]];
+function scalingMask(p) {
+  const h = (own(p.display).heirloom || {});
+  if (+h.mask) return +h.mask;
+  const caster = ["caster", "healer"].includes(profileOf(p)), at = +subOf(p);
+  if (p.cls === 2) {
+    if (p.sub === 19) return 0x10 | 0x4000;
+    if ([2, 3, 18, 16].includes(p.sub) || [15, 25, 26].includes(p.inv)) return 0x10 | 0x2000;
+    const two = p.inv === 17;
+    if (caster) return 0x8 | (two ? 0x1000 : 0x800) | 0x8000;
+    return two ? (0x8 | 0x400) : (0x4 | 0x200);
+  }
+  if (p.inv === 3) return 0x1 | (SHOULDER_ARMOR[at] || 0);
+  if (p.inv === 5 || p.inv === 20) return 0x8 | (CHEST_ARMOR[at] || 0);
+  if (p.inv === 16) return 0x8 | 0x80000;
+  if (p.inv === 12) return 0x2;
+  return 0x8;
+}
+function ssv(level, column) {
+  const row = (SG.opts.scaling || {})[level], k = (SG.opts.scaling_columns || []).indexOf(column);
+  return row && k >= 0 ? row[k] : 0;
+}
+// the piece's numbers at the wearer's `level`: stats, armor, damage (null when it is no heirloom)
+function heirloomAt(p, level) {
+  const e = SG.edits.pieces[p.display] || {}, h = heirloomOf(p);
+  if (!h) return null;
+  const top = h.max, L = Math.max(1, Math.min(level, top)), mask = scalingMask(p);
+  const col = (BUDGET_BITS.find(([b]) => mask & b) || [0, "PrimaryBudget"])[1];
+  const atTop = ssv(top, col), atL = ssv(L, col);
+  const stats = (e.stats || []).filter(([, v]) => +v).map(([t, v]) => {
+    const bonus = atTop ? Math.max(1, Math.round(v * 10000 / atTop)) : 0;
+    return [t, Math.floor(bonus * atL / 10000)];
+  });
+  const armorCol = (ARMOR_BITS.find(([b]) => mask & b) || [])[1];
+  const dpsCol = (DPS_BITS.find(([b]) => mask & b) || [])[1];
+  const dps = dpsCol ? ssv(L, dpsCol) : 0, delay = +e.delay || 2000;
+  return {level: L, top, mask, stats, armor: armorCol ? ssv(L, armorCol) : null,
+          spell: mask & 0x8000 ? ssv(L, "SpellPower") : 0,
+          dmg: dps ? [Math.floor(dps * delay / 1000 * 0.7), Math.ceil(dps * delay / 1000 * 1.3)] : null};
+}
+function heirloomSection(p) {
+  const e = own(p.display), h = e.heirloom || {}, every = allHeirloom();
+  const set = patch => { e.heirloom = {...h, ...patch, role: profileOf(p)}; saveStats(); renderStats(); };
+  const on = el("input", {type: "checkbox", checked: !!h.on || every, disabled: every});
+  on.addEventListener("change", () => {
+    e.heirloom = {...h, on: on.checked, max: h.max || 80, role: profileOf(p)};
+    // no stats yet (or filled in by the rules): filled in for its max level now
+    if (on.checked && (!(e.stats || []).length || e.stats_mode === "auto")) fillPiece(p, SG.pieces.indexOf(p));
+    saveStats(); renderStats();
+  });
+  const kids = [el("label", {class: "check"}, on, " Heirloom: its stats grow with the wearer's level (bound to the account)"),
+                every ? el("div", {class: "muted small"}, "Every piece is an heirloom: Quality is Heirloom for every piece, above.") : null];
+  if (h.on || every) {
+    const top = heirloomOf(p).max;
+    const lvl = el("input", {type: "range", min: 1, max: top, value: Math.min(SG.hlLevel || top, top), "aria-label": "Wearer's level"});
+    const lvlText = el("span", {class: "muted small"}, `shown at level ${Math.min(SG.hlLevel || top, top)}`);
+    lvl.addEventListener("input", () => { SG.hlLevel = +lvl.value; lvlText.textContent = `shown at level ${lvl.value}`; renderTooltip(); });
+    const mask = scalingMask(p);
+    kids.push(el("div", {class: "erow"},
+      el("label", {class: "efield"}, el("span", {}, "Max level"),
+        num({min: 1, max: 80}, top, v => {
+          e.heirloom = {...h, max: Math.max(1, Math.min(+v || 80, 80)), role: profileOf(p)};
+          if (e.stats_mode === "auto") fillPiece(p, SG.pieces.indexOf(p));
+          saveStats(); renderStats();
+        })),
+      el("label", {class: "efield"}, el("span", {}, "Tooltip at level"), el("span", {class: "pair"}, lvl, lvlText))),
+      el("div", {class: "muted small"}, `The stats above are what it has at level ${top}; below that they shrink with the ` +
+        `level's budget (${(BUDGET_BITS.find(([b]) => mask & b) || [0, "PrimaryBudget"])[1]}). ` +
+        (ARMOR_BITS.some(([b]) => mask & b) ? "Its armor scales too. " : p.cls === 4 && p.inv !== 12 ? "Its armor stays as set (3.3.5 scales shoulder, chest and cloak armor only). " : "") +
+        (DPS_BITS.some(([b]) => mask & b) ? "Its damage scales too. " : "") + `ScalingStatValue ${mask}.`));
+    if (!Object.keys(SG.opts.scaling || {}).length) kids.push(el("div", {class: "warnline"}, "The client's ScalingStatValues.dbc could not be read (Settings: the client folder)."));
+  }
+  return el("div", {class: "esec"}, el("h4", {}, "Heirloom"), ...kids.filter(Boolean));
+}
+
 // -- the tooltip, as the 3.3.5 client draws it -------------------------------------------------
 function renderTooltip() {
   const p = piece(SG.sel), tip = $("#stats-tooltip");
   if (!p) { tip.replaceChildren(); return; }
-  const e = SG.edits.pieces[p.display] || {}, q = qualityOf(p), L = [];
+  const e = SG.edits.pieces[p.display] || {}, L = [];
+  const hl = heirloomAt(p, SG.hlLevel || 80), q = hl ? 7 : qualityOf(p);
   const line = (text, cls = "", right = null) => L.push(el("div", {class: "tl " + cls}, el("span", {}, text), right ? el("span", {}, right) : null));
   line(e.name || p.name, "name");
   L[L.length - 1].style.color = QCOL[q];
   const bond = +eff(p, "bonding", 0);
-  if (bond) line(SG.opts.bonding[bond]);
+  if (hl) line("Binds to account");
+  else if (bond) line(SG.opts.bonding[bond]);
   if (e.unique) line("Unique");
   line(INV_NAMES[p.inv] || "", "", typeName(p) || null);
-  if (isWeapon(p) && e.dmg_max) {
-    line(`${e.dmg_min || 0} - ${e.dmg_max} Damage`, "", `Speed ${((e.delay || 2000) / 1000).toFixed(2)}`);
-    line(`(${(((+e.dmg_min || 0) + (+e.dmg_max)) / 2 / ((e.delay || 2000) / 1000)).toFixed(1)} damage per second)`);
+  const [dmin, dmax] = hl && hl.dmg ? hl.dmg : [e.dmg_min, e.dmg_max];
+  if (isWeapon(p) && dmax) {
+    line(`${dmin || 0} - ${dmax} Damage`, "", `Speed ${((e.delay || 2000) / 1000).toFixed(2)}`);
+    line(`(${(((+dmin || 0) + (+dmax)) / 2 / ((e.delay || 2000) / 1000)).toFixed(1)} damage per second)`);
   }
-  if (+e.armor) line(`${e.armor} Armor`);
+  const armor = hl && hl.armor != null ? hl.armor : e.armor;
+  if (+armor) line(`${armor} Armor`);
   if (+e.block) line(`${e.block} Block`);
-  const stats = (e.stats || []).filter(([, v]) => +v);
+  const stats = hl ? hl.stats.filter(([, v]) => +v) : (e.stats || []).filter(([, v]) => +v);
   for (const [t, v] of stats) if (t in BASE_TEXT) line(`${v > 0 ? "+" : ""}${v} ${BASE_TEXT[t]}`);
   for (const c of e.sockets || []) L.push(el("div", {class: "tl socket"}, el("i", {style: `background:${SOCKET_COLORS[c]}`}),
                                              `${SG.opts.sockets[c]} Socket`));
@@ -456,9 +579,12 @@ function renderTooltip() {
   if (mask > 0 && (mask & 1535) !== 1535)
     L.push(el("div", {class: "tl"}, el("span", {}, "Classes: ", ...Object.entries(SG.opts.classes).filter(([id]) => mask & (1 << (id - 1)))
       .flatMap(([id, n], k) => [k ? ", " : "", el("span", {style: `color:${CLASS_COLORS[id]}`}, n)]))));
-  const req = +eff(p, "req", 0);
+  const req = hl ? 0 : +eff(p, "req", 0);          // an heirloom is worn from level 1
   if (req) line(`Requires Level ${req}`);
   for (const [t, v] of stats) if (!(t in BASE_TEXT)) line("Equip: " + (EQUIP_TEXT[t] || `${(SG.opts.stats[t] || ["?"])[0]} %d.`).replace("%d", v), "green");
+  if (hl && hl.spell) line(`Equip: Increases spell power by ${hl.spell}.`, "green");
+  if (hl && !hl.stats.length) line("No stats yet: Fill in, or add some (they are its stats at its max level)", "grey");
+  if (hl) line(`(at level ${hl.level}: an heirloom, up to level ${hl.top})`, "grey");
   const set = SG.edits.sets.find(s => (s.pieces || []).includes(p.display));
   if (set) {
     L.push(el("div", {class: "tl gap"}));

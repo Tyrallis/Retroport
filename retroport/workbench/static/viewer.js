@@ -12,7 +12,8 @@ const VS = `#version 300 es
 in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec2 aUv2; in vec4 aW; in uvec4 aB;
 uniform mat4 uMvp; uniform mat4 uView; uniform mat4 uModel; uniform highp sampler2D uBones; uniform bool uSkinned;
 uniform mat4 uUvMat; uniform mat4 uUv2Mat; uniform mat4 uUv3Mat; uniform ivec3 uCoord; uniform bool uEdge;
-out vec3 vN; out vec2 vUv; out vec2 vUv2; out vec2 vUv3; out float vEdge;
+uniform float uPush;
+out vec3 vN; out vec2 vUv; out vec2 vUv2; out vec2 vUv3; out float vEdge; out float vFace;
 mat4 bone(uint i) {
   int x = int(i) * 4;
   return mat4(texelFetch(uBones, ivec2(x, 0), 0), texelFetch(uBones, ivec2(x + 1, 0), 0),
@@ -25,13 +26,14 @@ void main() {
   if (uSkinned && s > 0.001)
     skin = (aW.x * bone(aB.x) + aW.y * bone(aB.y) + aW.z * bone(aB.z) + aW.w * bone(aB.w)) / s;
   mat4 m = uModel * skin;
-  vec4 wp = m * vec4(aPos, 1.0);
+  vec4 wp = m * vec4(aPos + aNrm * uPush, 1.0);
   vN = mat3(m) * aNrm;
   vec3 e = normalize((uView * wp).xyz), n = normalize(mat3(uView) * vN);
   vec3 r = e - n * (2.0 * dot(e, n));
   vec2 env = normalize(vec3(r.xy, r.z + 1.0)).xy * 0.5 + 0.5;
   float f = clamp(abs(dot(e, n)), 0.0, 1.0);
   vEdge = uEdge ? clamp(2.7 * f * f - 0.4, 0.0, 1.0) : 1.0;
+  vFace = f;
   vUv = (uUvMat * vec4(coord(uCoord.x, env), 0.0, 1.0)).xy;
   vUv2 = (uUv2Mat * vec4(coord(uCoord.y, env), 0.0, 1.0)).xy;
   vUv3 = (uUv3Mat * vec4(coord(uCoord.z, env), 0.0, 1.0)).xy;
@@ -41,14 +43,27 @@ void main() {
 // added on top (sp) and an opacity (a). uWgt: the weights of its three textures.
 const FS = `#version 300 es
 precision mediump float;
-in vec3 vN; in vec2 vUv; in vec2 vUv2; in vec2 vUv3; in float vEdge;
+in vec3 vN; in vec2 vUv; in vec2 vUv2; in vec2 vUv3; in float vEdge; in float vFace;
+uniform int uFx; uniform vec3 uC0; uniform vec3 uC1; uniform vec3 uC2; uniform vec3 uFxEdge; uniform vec2 uFxA;
 uniform sampler2D uTex; uniform bool uHasTex; uniform sampler2D uTex2; uniform sampler2D uTex3;
-uniform int uPs; uniform vec3 uWgt; uniform bool uKeyTex;
+uniform int uPs; uniform vec3 uWgt; uniform bool uKeyTex; uniform bool uMask;
 uniform float uAlphaRef; uniform bool uUnlit; uniform bool uOpaque; uniform bool uPremul;
 uniform vec3 uLight; uniform vec4 uTint;
 out vec4 outColor;
 void main() {
   vec4 t0 = uHasTex ? texture(uTex, vUv) : vec4(0.55, 0.55, 0.58, 1.0);
+  // a creature's state effects (retail's GradientEffect and OutlineEffect): 2 its outline - the
+  // pushed-out back faces in the edge colour, a rim round its silhouette; 1 its gradient - a glow from
+  // the first colour where it faces you through the second to the third at its edges, added on top
+  if (uFx > 0) {
+    if (uHasTex && uAlphaRef > 0.1 && t0.a < 0.5) discard;
+    if (uFx == 2) { outColor = vec4(uFxEdge, 1.0); return; }
+    float t = clamp(1.0 - vFace, 0.0, 1.0);
+    vec3 c = t < 0.5 ? mix(uC0, uC1, t * 2.0) : mix(uC1, uC2, t * 2.0 - 1.0);
+    float ga = mix(uFxA.x, uFxA.y, t) * t;
+    outColor = vec4(c * ga, ga);
+    return;
+  }
   vec4 t1 = texture(uTex2, vUv2), t2 = texture(uTex3, vUv3);
   vec3 d = t0.rgb, sp = vec3(0.0);
   float a = 1.0;
@@ -87,6 +102,9 @@ void main() {
     case 35: { vec4 x = t0 * t1 * t2; d = x.rgb; a = x.a; break; }
     default: break;
   }
+  // a packed shader over three textures: the third is the batch's mask (the ring of a ground circle,
+  // the outline of a glow plane) - it multiplies whatever the first two made, colour and alpha
+  if (uMask) { d *= t2.rgb; sp *= t2.rgb; a *= t2.a; }
   if (uKeyTex) a = t0.a;                     // an alpha-keyed batch with an opaque combiner: cut by its texture
   a = clamp(a * vEdge, 0.0, 1.0) * uTint.a;
   if (a < uAlphaRef) discard;
@@ -152,6 +170,40 @@ const M4 = {
   },
 };
 const IDENT = M4.ident();
+
+// -- retail physics (hair, cloth, wings, chains, plumes) -----------------------------------------
+// The engine Equip Plus runs in the client (Kirazul's port of retail's), built to physics.wasm.
+// A mesh whose model carries a .phys gets a simulation: each frame its bones go in (in the world),
+// its dynamic bodies come out (in model space), and every bone under a moved one follows it.
+const PHYS = {module: null, loading: null};
+function physicsModule() {
+  if (PHYS.module) return Promise.resolve(PHYS.module);
+  if (!PHYS.loading) {
+    const stub = () => 0;
+    PHYS.loading = fetch("/static/physics.wasm").then(r => r.arrayBuffer())
+      .then(buf => WebAssembly.instantiate(buf, {wasi_snapshot_preview1: {fd_close: stub, fd_seek: stub, fd_write: stub}}))
+      .then(({instance}) => { instance.exports._initialize(); PHYS.module = instance.exports; return PHYS.module; })
+      .catch(e => { console.warn("physics.wasm:", e); PHYS.loading = null; return null; });
+  }
+  return PHYS.loading;
+}
+function transpose(m, o = new Float64Array(16)) {
+  for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) o[r * 4 + c] = m[c * 4 + r];
+  return o;
+}
+// inverse of an affine column-major matrix
+function invAffine(m) {
+  const a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+  const det = a * (e * i - f * h) - d * (b * i - c * h) + g * (b * f - c * e);
+  if (Math.abs(det) < 1e-12) return null;
+  const k = 1 / det, o = new Float32Array(16);
+  o[0] = (e * i - f * h) * k; o[1] = (c * h - b * i) * k; o[2] = (b * f - c * e) * k;
+  o[4] = (f * g - d * i) * k; o[5] = (a * i - c * g) * k; o[6] = (c * d - a * f) * k;
+  o[8] = (d * h - e * g) * k; o[9] = (b * g - a * h) * k; o[10] = (a * e - b * d) * k;
+  for (let r = 0; r < 3; r++) o[12 + r] = -(o[r] * m[12] + o[4 + r] * m[13] + o[8 + r] * m[14]);
+  o[15] = 1;
+  return o;
+}
 function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
 function norm(v) { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; }
 function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
@@ -244,6 +296,7 @@ function shaderOf(b) {
                   PS.Opaque_Mod, PS.Opaque_Mod, PS.Opaque_AddAlpha_Alpha];
   const ps = (s & 0x70 ? mod : opaque)[((s & 0xFF) ^ 4) & 7];
   const coords = s & 0x80 ? [ENV, s & 0x8 ? ENV : U1] : [U1, s & 0x8 ? ENV : (s & 0x4000 ? U2 : U1)];
+  if (n >= 3) return {ps, coords: [...coords, U2], edge: false, mask: true};
   return {ps, coords, edge: false};
 }
 
@@ -265,9 +318,9 @@ class Viewer {
     };
     this.prog = program(VS, FS);
     this.u = {};
-    for (const n of ["uMvp", "uView", "uModel", "uBones", "uSkinned", "uTex", "uHasTex", "uTex2", "uTex3", "uPs", "uWgt",
+    for (const n of ["uMvp", "uView", "uModel", "uBones", "uSkinned", "uTex", "uHasTex", "uTex2", "uTex3", "uPs", "uWgt", "uMask",
                      "uKeyTex", "uUvMat", "uUv2Mat", "uUv3Mat", "uCoord", "uEdge", "uAlphaRef", "uUnlit", "uOpaque",
-                     "uPremul", "uLight", "uTint"])
+                     "uPremul", "uLight", "uTint", "uPush", "uFx", "uC0", "uC1", "uC2", "uFxEdge", "uFxA"])
       this.u[n] = gl.getUniformLocation(this.prog, n);
     this.a = {};
     for (const n of ["aPos", "aNrm", "aUv", "aUv2", "aW", "aB"]) this.a[n] = gl.getAttribLocation(this.prog, n);
@@ -283,6 +336,7 @@ class Viewer {
     gl.enableVertexAttribArray(this.pa.col); gl.vertexAttribPointer(this.pa.col, 4, gl.FLOAT, false, 36, 20);
     gl.bindVertexArray(null);
     this.parts = []; this.textures = new Map(); this.start0 = performance.now(); this.last = 0;
+    this.cull = gl.CCW;                              // M2 front faces wind counter-clockwise on screen
     this.view = {yaw: 0.35, pitch: 0.12, dist: 3, center: [0, 0, 0]};
     this.home = {...this.view};
     let drag = null;
@@ -313,6 +367,7 @@ class Viewer {
     const gl = this.gl;
     for (const p of this.parts) {
       gl.deleteVertexArray(p.vao); p.buffers.forEach(b => gl.deleteBuffer(b)); gl.deleteTexture(p.boneTex);
+      this.dropPhysics(p);
     }
     this.parts = [];
     this.clock = null;
@@ -415,6 +470,12 @@ class Viewer {
     const part = {vao, buffers, mesh, bones, opts, offset: opts.offset || [0, 0, 0], world: [], mats: null, positions, indices, orient: null,
                   boneTex: gl.createTexture(), nb: Math.max(1, bones.length), visible: opts.visible || (() => true),
                   tint: opts.tint || [1, 1, 1, 1], uvMats: [], colors: [], weights: []};
+    if (opts.glow) {
+      let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (let i = 0; i < positions.length; i += 3)
+        for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], positions[i + k]); hi[k] = Math.max(hi[k], positions[i + k]); }
+      part.radius = Math.max(0.05, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2);
+    }
     part.mats = new Float32Array(part.nb * 16);
     for (let i = 0; i < part.nb; i++) part.mats.set(IDENT, i * 16);
     gl.bindTexture(gl.TEXTURE_2D, part.boneTex);
@@ -429,21 +490,91 @@ class Viewer {
     const url = fdid => fdid && opts.texUrl ? opts.texUrl(fdid) : null;
     part.batches = mesh.batches.map(b => {
       const src = b.texture ? url(b.texture) : (opts.types || {})[b.texture_type];
-      const sh = shaderOf(b), need = PS_TEXTURES(sh.ps), layers = b.layers || [];
+      const sh = shaderOf(b), need = sh.mask ? 3 : PS_TEXTURES(sh.ps), layers = b.layers || [];
       const extra = layers.slice(0, need - 1).map(l => { const u = url(l.texture); return u ? this.texture(u) : null; });
-      return {...b, tex: src ? this.texture(src) : null, missing: !src && b.texture_type !== 0, sh, extra};
+      return {...b, tex: src ? this.texture(src) : null, missing: !src && b.texture_type !== 0, sh, extra, need};
     });
     // drawn as the client draws a model's batches: by priority plane, lowest first (a hood's glowing eyes,
     // priority 4, over its dark inside, priority 0, whatever order the file lists them in)
     part.batches.sort((a, b) => (a.priority || 0) - (b.priority || 0));
     part.emitters = (mesh.particles || []).map(d => ({def: d, list: [], acc: 0, tex: this.texture(url(d.texture))}));
+    if (mesh.physics && mesh.fdid && bones.length > 1 && opts.physics !== false) this.attachPhysics(part);
     this.parts.push(part);
     return part;
   }
 
+  // fetches the model's physics row and makes its simulation; the part moves by it from then on
+  async attachPhysics(part) {
+    try {
+      const [E, row] = await Promise.all([physicsModule(),
+        fetch(`/api/physics?fdid=${part.mesh.fdid}`).then(r => r.json())]);
+      if (!E || !row || !row.table64 || !this.parts.includes(part)) return;
+      const bytes = Uint8Array.from(atob(row.table64), ch => ch.charCodeAt(0));
+      const tp = E.ph_alloc(bytes.length);
+      new Uint8Array(E.memory.buffer).set(bytes, tp);
+      const h = E.ph_create(tp, bytes.length);
+      E.ph_free(tp);
+      if (!h) return;
+      const n = part.bones.length, nb = E.ph_bodies(h), bodyBone = [];
+      for (let i = 0; i < nb; i++) bodyBone.push(E.ph_body_bone(h, i));
+      if (bodyBone.some(b => b !== 0xFFFF && b >= n)) { E.ph_destroy(h); return; }   // the row is not this file's
+      const pv = E.ph_alloc(n * 12);
+      new Float32Array(E.memory.buffer, pv, n * 3).set(part.bones.flatMap(b => b.v || [0, 0, 0]));
+      part.phys = {E, h, bodyBone, pv, bw: E.ph_alloc(n * 128), pl: E.ph_alloc(128), out: E.ph_alloc(128), last: 0};
+      this.physicsOn = this.physicsOn ?? true;
+      this.draw();
+    } catch (e) { console.warn("physics:", e); }
+  }
+
+  dropPhysics(p) {
+    const ph = p.phys;
+    if (!ph) return;
+    [ph.pv, ph.bw, ph.pl, ph.out].forEach(x => ph.E.ph_free(x));
+    ph.E.ph_destroy(ph.h);
+    p.phys = null;
+  }
+
+  // one physics frame for a posed part: its bones (p.mats, model space) in, its dynamic bones out
+  stepPhysics(p, nowMs) {
+    const ph = p.phys, E = ph.E, n = p.bones.length;
+    const model = this.modelMatrix(p);
+    if (!model) return;
+    const dt = ph.last ? Math.min(0.1, Math.max(0, (nowMs - ph.last) / 1000)) : 0;
+    ph.last = nowMs;
+    const D = new Float64Array(E.memory.buffer), tmp = new Float32Array(16), col = new Float64Array(16);
+    const before = p.mats.slice(0, n * 16);
+    for (let i = 0; i < n; i++) {
+      M4.mul(model, before.subarray(i * 16, i * 16 + 16), tmp);
+      D.set(transpose(tmp, col), ph.bw / 8 + i * 16);
+    }
+    D.set(transpose(model, col), ph.pl / 8);
+    E.ph_step(ph.h, ph.bw, ph.pv, n, ph.pl, dt);
+    const moved = new Uint8Array(n);
+    ph.bodyBone.forEach((bone, i) => {
+      if (bone === 0xFFFF || bone >= n || !E.ph_output(ph.h, i, ph.out)) return;
+      const o = new Float64Array(E.memory.buffer, ph.out, 16);
+      if (!o.every(Number.isFinite)) return;
+      const m = new Float32Array(16);
+      for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) m[c * 4 + r] = o[r * 4 + c];
+      p.mats.set(m, bone * 16);
+      moved[bone] = 1;
+    });
+    // every bone under a moved one is carried by that bone's change: B'c = B'a x Ba^-1 x Bc
+    for (let c = 0; c < n; c++) {
+      if (moved[c]) continue;
+      let a = p.bones[c].p, guard = 0;
+      while (a >= 0 && a < n && !moved[a] && guard++ < 256) a = p.bones[a].p;
+      if (a < 0 || a >= n || !moved[a]) continue;
+      const inv = invAffine(before.subarray(a * 16, a * 16 + 16));
+      if (!inv) continue;
+      const d = M4.mul(p.mats.subarray(a * 16, a * 16 + 16), inv);
+      p.mats.set(M4.mul(d, before.subarray(c * 16, c * 16 + 16)), c * 16);
+    }
+  }
+
   animated() {
     if (this.clock && !this.clock.paused) return true;
-    return this.parts.some(p => p.bones.some(b => b.t || b.r || b.s) || p.opts.bodyOf || p.opts.attach || p.emitters.length ||
+    return this.parts.some(p => p.phys || p.bones.some(b => b.t || b.r || b.s) || p.opts.bodyOf || p.opts.attach || p.emitters.length ||
                                 (p.mesh.uvanims || []).some(u => u.t || u.r || u.s) ||
                                 (p.mesh.colors || []).length || (p.mesh.weights || []).some(w => w && w.t.length > 1));
   }
@@ -482,7 +613,10 @@ class Viewer {
 
   // the bind-pose bounds of what a part draws (a shared collection shows only some of its parts)
   drawnBounds(p) {
-    if (!p.opts.visible) return p.mesh.bounds;
+    // a model of particles alone (a ghost's fog) has no surface: it doesn't frame the view
+    const mb = p.mesh.bounds;
+    if (!p.mesh.vertices || !mb || mb[0][0] > mb[1][0]) return null;
+    if (!p.opts.visible) return mb;
     const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
     let any = false;
     for (const b of p.batches) {
@@ -622,6 +756,11 @@ class Viewer {
       if (!p.opts.bodyOf) continue;
       const body = p.opts.bodyOf;
       p.map.forEach((bi, i) => { p.mats.set(bi >= 0 && body.world[bi] ? body.world[bi] : IDENT, i * 16); });
+    }
+    for (const p of this.parts) {
+      if (!p.phys) continue;
+      if (this.physicsOn === false) { p.phys.last = 0; continue; }
+      this.stepPhysics(p, performance.now());
     }
   }
 
@@ -809,12 +948,13 @@ class Viewer {
           gl.uniform1i(this.u.uHasTex, t ? 1 : 0);
           if (t) this.bindTexture(gl.TEXTURE0, t, b.wrap);
           // the combiner, or the first texture alone while one of the others is missing or loading
-          const sh = b.sh, full = b.extra.length === PS_TEXTURES(sh.ps) - 1 && b.extra.every(x => x && x.ready);
+          const sh = b.sh, full = b.extra.length === b.need - 1 && b.extra.every(x => x && x.ready);
           const ps = full ? sh.ps : (PS_MOD.has(sh.ps) ? PS.Mod : PS.Opaque);
           gl.uniform1i(this.u.uPs, ps);
           gl.uniform1i(this.u.uKeyTex, b.blend === 1 && !PS_MOD.has(ps) ? 1 : 0);
           gl.uniform3i(this.u.uCoord, sh.coords[0], sh.coords[1] ?? U1, sh.coords[2] ?? U1);
           gl.uniform1i(this.u.uEdge, sh.edge ? 1 : 0);
+          gl.uniform1i(this.u.uMask, full && sh.mask ? 1 : 0);
           const layers = b.layers || [], wt = i => i >= 0 && p.weights[i] !== undefined ? p.weights[i] : 1;
           gl.uniform3f(this.u.uWgt, wt(b.weight), wt(layers[0] ? layers[0].weight : -1), wt(layers[1] ? layers[1].weight : -1));
           // a texture animation belongs to the coordinates, not the texture: the first UVs move by the
@@ -825,17 +965,74 @@ class Viewer {
           const matOf = c => c === U1 ? m0 : c === U2 ? m1 : IDENT;
           gl.uniformMatrix4fv(this.u.uUvMat, false, matOf(sh.coords[0]));
           gl.uniformMatrix4fv(this.u.uUv2Mat, false, matOf(sh.coords[1] ?? U1));
-          gl.uniformMatrix4fv(this.u.uUv3Mat, false, matOf(sh.coords[2] ?? U1));
+          // a mask has a transform of its own (most often none): it stays put under the scrolling layers
+          gl.uniformMatrix4fv(this.u.uUv3Mat, false, sh.mask ? uvMat(p, layers[1] ? layers[1].uvanim : -1) : matOf(sh.coords[2] ?? U1));
           if (full) b.extra.forEach((x, i) => this.bindTexture(i ? gl.TEXTURE3 : gl.TEXTURE2, x, layers[i].wrap));
           gl.uniform1f(this.u.uAlphaRef, b.blend === 1 ? 0.5 : (b.blend >= 2 ? 0.004 : -1));
           gl.uniform1i(this.u.uUnlit, b.unlit ? 1 : 0);
           gl.uniform1i(this.u.uOpaque, b.blend === 0 && tint[3] >= 1 ? 1 : 0);
+          // a one-sided material shows its front faces only, as the game draws it: a shell built round
+          // a model (Gul'dan's glowing outline) then shows only at its silhouette, not over the body
+          if (this.cull && b.two_sided === false) { gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK); gl.frontFace(this.cull); }
+          else gl.disable(gl.CULL_FACE);
           gl.drawElements(gl.TRIANGLES, b.count, gl.UNSIGNED_INT, b.start * 4);
         }
       }
     }
+    gl.disable(gl.CULL_FACE);
+    this.drawGlow(T);
     gl.bindVertexArray(null);
     this.drawParticles(mvp, view);
+    gl.depthMask(true); gl.disable(gl.BLEND);
+  }
+
+  // A part's state effects (opts.glow, from retail's GradientEffect and OutlineEffect): {edge: [r, g, b]}
+  // draws its outline, {colors: [c0, c1, c2], alphas: [inner, edge]} its gradient glow. Over its solid
+  // batches only (an alpha-keyed one cut by its texture), after everything else.
+  drawGlow(T) {
+    const gl = this.gl, u = this.u;
+    for (const p of this.parts) {
+      // a glow may follow the timeline: a function of it (a spell's aura glow)
+      const g = typeof p.opts.glow === "function" ? p.opts.glow(T) : p.opts.glow;
+      if (!g || !this.active(p, T)) continue;
+      const model = this.modelMatrix(p);
+      if (!model) continue;
+      gl.uniformMatrix4fv(u.uModel, false, model);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, p.boneTex);
+      gl.bindVertexArray(p.vao);
+      const solid = p.batches.filter(b => !b.missing && p.visible(b.geoset) && b.blend < 2);
+      const each = () => {
+        for (const b of solid) {
+          const t = b.tex && b.tex.ready ? b.tex : null;
+          gl.uniform1i(u.uHasTex, t ? 1 : 0);
+          if (t) this.bindTexture(gl.TEXTURE0, t, b.wrap);
+          gl.uniform3i(u.uCoord, b.sh.coords[0], U1, U1);
+          gl.uniformMatrix4fv(u.uUvMat, false, b.uvanim >= 0 && p.uvMats[b.uvanim] ? p.uvMats[b.uvanim] : IDENT);
+          gl.uniform1f(u.uAlphaRef, b.blend === 1 ? 0.5 : -1);
+          gl.drawElements(gl.TRIANGLES, b.count, gl.UNSIGNED_INT, b.start * 4);
+        }
+      };
+      if (g.edge) {
+        // the outline: the model's back faces, pushed out a little, in the edge colour
+        this.blend(0);
+        gl.enable(gl.CULL_FACE); gl.cullFace(g.cull || gl.FRONT);
+        gl.uniform1i(u.uFx, 2);
+        gl.uniform3fv(u.uFxEdge, g.edge);
+        gl.uniform1f(u.uPush, (g.width || 0.012) * (p.radius || 1));
+        each();
+        gl.disable(gl.CULL_FACE);
+        gl.uniform1f(u.uPush, 0);
+      }
+      if (g.colors) {
+        gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false); gl.depthFunc(gl.LEQUAL);
+        gl.uniform1i(u.uFx, 1);
+        gl.uniform3fv(u.uC0, g.colors[0]); gl.uniform3fv(u.uC1, g.colors[1]); gl.uniform3fv(u.uC2, g.colors[2]);
+        gl.uniform2f(u.uFxA, g.alphas ? g.alphas[0] : 0.5, g.alphas ? g.alphas[1] : 0.8);
+        each();
+        gl.depthFunc(gl.LESS);
+      }
+      gl.uniform1i(u.uFx, 0);
+    }
     gl.depthMask(true); gl.disable(gl.BLEND);
   }
 

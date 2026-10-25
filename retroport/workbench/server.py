@@ -50,6 +50,7 @@ from . import catalog as C
 from . import character as CH
 from . import creatures as CR
 from . import spells as SP
+from . import mounts as MT
 from . import kit as K
 from . import itemstats as IS
 from . import models as M
@@ -199,6 +200,7 @@ class Workbench:
         self._options_lock = threading.Lock()
         self.creatures = CR.Creatures(self)
         self.spells = SP.Spells(self)
+        self.mounts = MT.Mounts(self)
         self.configure()
 
     def configure(self) -> None:
@@ -308,7 +310,11 @@ class Workbench:
 
     def stats_options(self) -> dict:
         opts = self.client_options()
-        return {"classes": IS.CLASSES, "qualities": IS.QUALITIES, "bonding": IS.BONDING, "armour_types": IS.ARMOUR_TYPES,
+        try:
+            scaling = {lvl: [row[c] for c in IS.SSV_COLUMNS] for lvl, row in IS.scaling_values(self.settings.client).items()}
+        except Exception:
+            scaling = {}
+        return {"scaling": scaling, "scaling_columns": IS.SSV_COLUMNS, "classes": IS.CLASSES, "qualities": IS.QUALITIES, "bonding": IS.BONDING, "armour_types": IS.ARMOUR_TYPES,
                 "sockets": IS.SOCKETS, "stats": {k: [v[0], v[1], v[2]] for k, v in IS.STATS.items()},
                 "tables": WK.tables(self.reference()), "bonuses": opts["bonuses"], "socket_bonuses": opts["socket_bonuses"]}
 
@@ -373,7 +379,7 @@ class Workbench:
                 if kit._run(["pack", "--work", work], step="pack") != 0 or not kit.ledger().get("pack", {}).get("ok"):
                     kit.say("!! the kit could not pack the changed item table")
                     return False
-            path = IS.write_sql(work, edits, sids, self.look_names())
+            path = IS.write_sql(work, edits, sids, self.look_names(), self._scalings(work, edits))
             if path:
                 n = sum(1 for line in open(path, encoding="utf-8") if line.startswith("UPDATE"))
                 kit.say(f"Stats: {n} item(s) with their stats in {path}")
@@ -383,7 +389,82 @@ class Workbench:
             kit.say(f"!! the Stats step: {type(e).__name__}: {e}")
             return False
 
+    def _scalings(self, work: str, edits: dict) -> dict:
+        """The heirloom pieces' ScalingStatDistribution rows (itemstats.scaling_rows), {} for none."""
+        ids = K._load_json(os.path.join(work, "ids.json"), {}) or {}
+        pieces = IS.heirloom_pieces(edits, (ids.get("item") or {}).keys())
+        if not pieces or not self.settings.client:
+            return {}
+        kit_sql = os.path.join(work, "out", "sql", "item_template.sql")
+        kit = IS.kit_items(open(kit_sql, encoding="utf-8").read()) if os.path.isfile(kit_sql) else {}
+        sids = IS.scaling_ids(self.settings.data_dir, pieces)
+        return IS.scaling_rows(edits, ids, kit, IS.scaling_values(self.settings.client), sids)
+
+    def _install_dbc(self, kit, record: dict, backup: str, table: str, merge) -> None:
+        """One of the Stats step's tables (``merge(base) -> bytes``) into the kit's patch, on the
+        client's own rows below it, and into the server's dbc folder (backed up first)."""
+        from ..mpq import ClientData, add_files
+        c = kit.cfg
+        name = kit.patch_name()
+        target = os.path.join(c.client_data, name) if name else ""
+        rel = f"DBFilesClient\\{table}"
+        if target and os.path.isfile(target):
+            cd = ClientData(kit.client_root(), top=name)
+            try:
+                base = None
+                for _label, src in cd.sources:
+                    if (os.path.basename(src) if isinstance(src, str) else os.path.basename(src.path)).lower() == name.lower():
+                        continue                          # the kit's own patch: what it held before is ours
+                    if isinstance(src, str):
+                        f = os.path.join(src, "DBFilesClient", table)
+                        if os.path.isfile(f):
+                            base = open(f, "rb").read()
+                            break
+                    elif src.has(rel):
+                        base = src.read(rel)
+                        break
+            finally:
+                cd.close()
+            if base:
+                add_files(target, {rel: merge(base)})
+                kit.say(f"   {table}: added to the client's table (in {name})")
+        if c.server_dbc:
+            dest = os.path.join(c.server_dbc, table)
+            if os.path.isfile(dest):
+                current = open(dest, "rb").read()
+                merged = merge(current)
+                if merged != current:
+                    os.makedirs(os.path.join(backup, "server"), exist_ok=True)
+                    shutil.copy2(dest, os.path.join(backup, "server", table))
+                    with open(dest + ".part", "wb") as fh:
+                        fh.write(merged)
+                    os.replace(dest + ".part", dest)
+                    record["server"].append(table)
+                    kit.say(f"   server: updated {table}")
+
     def _stats_installed(self, kit, record: dict, backup: str) -> None:
+        # heirlooms: their stat distributions, in the client's table and the server's
+        try:
+            edits_ = IS.load(self.settings.data_dir)
+            scal = self._scalings(kit.cfg.work, edits_)
+            owned = set(IS._json(os.path.join(self.settings.data_dir, "item-scaling-ids.json"), {}).values())
+            if scal or owned:
+                rows = list(scal.values())
+                self._install_dbc(kit, record, backup, "ScalingStatDistribution.dbc",
+                                  lambda base: IS.ssd_dbc(base, rows, owned))
+                if rows:
+                    kit.say(f"   heirlooms: {len(rows)} piece(s) scale with level")
+        except Exception as e:
+            traceback.print_exc()
+            kit.say(f"!! heirloom scaling: {type(e).__name__}: {e}")
+        self._stats_sets_installed(kit, record, backup)
+        # the kit wrote its patch again: the mount items' icon and item rows go back in
+        try:
+            self.mounts.reapply(kit.say)
+        except Exception as e:
+            kit.say(f"!! mounts: {type(e).__name__}: {e}")
+
+    def _stats_sets_installed(self, kit, record: dict, backup: str) -> None:
         """Item sets: their rows in the client's ItemSet table (inside the kit's patch, just placed)
         and in the server's (backed up first)."""
         from ..dbc import DBCFile
@@ -1035,10 +1116,23 @@ def make_handler(wb: Workbench):
                     self._json(wb.creatures.set_settings(body or {}))
                 elif url.path == "/api/creatures/install":
                     self._json(wb.creatures.start_install())
+                elif url.path == "/api/mounts/basket":
+                    self._json(wb.mounts.set_basket(body or []))
+                elif url.path == "/api/mounts/install":
+                    self._json(wb.mounts.start_install())
                 elif url.path == "/api/spellport/ports":
                     self._json(wb.spells.port.set_ports(body or []))
                 elif url.path == "/api/spellport/install":
-                    self._json(wb.spells.port.install(bool((body or {}).get("restart")), wb.say))
+                    b = body or {}
+                    self._json(wb.spells.port.install(bool(b.get("restart")), wb.say,
+                                                      wod=bool(b["wod_models"]) if "wod_models" in b else None))
+                elif url.path == "/api/spellport/bulk":
+                    b = body or {}
+                    ids = wb.spells.matching_ids(str(b.get("q", "")), bool(b.get("models", True)), str(b.get("kind", "")),
+                                                 int(b.get("key") or 0), int(b.get("sub") or 0))
+                    self._json(wb.spells.port.add_many(ids))
+                elif url.path == "/api/spellport/options":
+                    self._json(wb.spells.port.set_options(body or {}))
                 elif url.path == "/api/kit/run":
                     wb.run_kit((body or {}).get("action", ""), (body or {}).get("step", ""))
                     self._json(wb.kit_status())
@@ -1117,14 +1211,43 @@ def make_handler(wb: Workbench):
                 return self._json(wb.creatures.preview(_int(q.get("display")) or 0))
             if path == "/api/creatures/state":
                 return self._json(wb.creatures.state())
+            if path == "/api/mounts":
+                return self._json(wb.mounts.search(q.get("q", ""), _int(q.get("page")) or 0, q.get("kind", "")))
+            if path == "/api/mount":
+                return self._json(wb.mounts.detail(_int(q.get("id")) or 0))
+            if path == "/api/mounts/state":
+                return self._json(wb.mounts.state())
+            if path == "/api/mounts/job":
+                return self._json(wb.mounts.job_view(_int(q.get("since")) or 0))
             if path == "/api/creatures/job":
                 return self._json(wb.creatures.job_view(_int(q.get("since")) or 0))
             if path == "/api/spells":
-                return self._json(wb.spells.search(q.get("q", ""), _int(q.get("page")) or 0, q.get("models") != "0"))
+                return self._json(wb.spells.search(q.get("q", ""), _int(q.get("page")) or 0, q.get("models") != "0",
+                                                   q.get("kind", ""), _int(q.get("key")) or 0, _int(q.get("sub")) or 0))
+            if path == "/api/spells/filters":
+                return self._json(wb.spells.filters())
             if path == "/api/spell":
                 return self._json(wb.spells.detail(_int(q.get("id")) or 0))
+            if path == "/api/physics":
+                from . import physics as PHY
+                try:
+                    return self._json(PHY.preview_row(wb, _int(q.get("fdid")) or 0))
+                except Exception as e:
+                    return self._json({"none": True, "error": f"{type(e).__name__}: {e}"})
             if path == "/api/spell/model":
                 return self._json(wb.spells.model(_int(q.get("fdid")) or 0, _int(q.get("texture")) or 0))
+            if path in ("/api/wowhead/npc-abilities", "/api/wowhead/spell-tooltip"):
+                from . import wowhead as WH
+                cache = os.path.join(wb.settings.data_dir, "cache")
+                try:
+                    if path.endswith("npc-abilities"):
+                        return self._json(WH.npc_abilities(_int(q.get("npc")) or 0, cache))
+                    return self._json(WH.spell_tooltip(_int(q.get("id")) or 0, cache))
+                except Exception as e:
+                    return self._json({"error": f"Wowhead: {e}"}, 502)
+            if path == "/api/spell/model-anims":
+                ids = [int(x) for x in (q.get("ids") or "").split(",") if x.strip().isdigit()]
+                return self._json(wb.spells.model_anims(_int(q.get("fdid")) or 0, ids))
             if path == "/api/spell/stage":
                 return self._json(wb.spells.stage())
             if path == "/api/spell/body-anims":

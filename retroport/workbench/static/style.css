@@ -485,3 +485,21 @@ canvas.viewer:active { cursor: grabbing; }
 .sp-port-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .sp-target { width: 140px; background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 4px 6px; }
 .sp-name { width: 260px; background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 4px 6px; }
+
+/* a creature's abilities (Wowhead) */
+.cr-abilities { display: grid; gap: 8px; }
+.cr-ability { display: flex; gap: 8px; align-items: flex-start; }
+.cr-ability img { border-radius: 4px; flex: none; }
+.cr-ability .muted { white-space: pre-line; }
+
+/* a spell's retail tooltip (Wowhead) */
+.sp-tooltip { display: flex; gap: 10px; align-items: flex-start; background: #0b0d14; border: 1px solid #3a3f52;
+              border-radius: 6px; padding: 8px 10px; margin: 8px 0; font-size: 13px; color: #fff; max-width: 420px; }
+.sp-tooltip table { border-collapse: collapse; width: 100%; }
+.sp-tooltip td, .sp-tooltip th { padding: 0; vertical-align: top; text-align: left; font-weight: normal; }
+.sp-tooltip th { text-align: right; }
+.sp-tooltip .q { color: #ffd100; }
+.sp-tooltip .q0 { color: #9d9d9d; }
+.sp-tooltip .q6 { color: #e6cc80; }
+.sp-tooltip .wowhead-tooltip-requirements { color: #fff; }
+.sp-tip-icon { border-radius: 4px; flex: none; }

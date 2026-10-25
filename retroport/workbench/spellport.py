@@ -23,6 +23,11 @@ client draws visuals from its own tables.
 
 Not carried (3.3.5 kits have no field for them, listed per port): an event's start delay, a model's
 offset and turn, a precast effect on the target or the ground, sounds, and animation ids past 3.3.5's.
+
+Retail visuals (a port's ``retail_visuals``, on by default): the spell's SpellVisual keeps only the
+caster's animations, and the whole retail visual goes into ``WXLRetailSpellVisuals.txt`` in DBFilesClient
+(``TABLE_HEADER``) for the client mod wxl.retail-spellvisuals, which plays every event at its moment
+with retail's delays, offsets, turns, scales and animations, and flies the missiles.
 """
 
 from __future__ import annotations
@@ -66,8 +71,111 @@ SLOT_NAMES = {"RightHandEffect": "right hand", "LeftHandEffect": "left hand", "B
               "ChestEffect": "chest", "BreathEffect": "breath", "SpecialEffect": "special"}
 
 
+# Flying everywhere: an area flies when its AreaTable flags have 0x400 and not 0x20000000 - the
+# client (IsInFlyableArea) and AzerothCore (AreaTableEntry::IsFlyable, the no-fly-zone checks and
+# Dalaran's forced dismount, spell 58600) both read them. Every area of the four continents gets
+# the first and loses the second; dungeons, raids and battlegrounds keep their own.
+AREA_FLYABLE, AREA_NO_FLY = 0x400, 0x20000000
+CONTINENTS = (0, 1, 530, 571)
+
+
+def fly_everywhere(table_bytes: bytes) -> tuple[bytes, int]:
+    """AreaTable.dbc with every continent area flyable; how many rows changed."""
+    t = D.DBCFile.from_bytes(table_bytes, "AreaTable.dbc")
+    changed = 0
+    for r in t.records:
+        if r[1] in CONTINENTS:
+            new = (r[4] | AREA_FLYABLE) & ~AREA_NO_FLY & 0xFFFFFFFF
+            if new != r[4]:
+                r[4] = new
+                changed += 1
+    return t.to_bytes(), changed
+
+
 def _f(v: float) -> int:
     return struct.unpack("<I", struct.pack("<f", float(v)))[0]
+
+
+class Anims:
+    """Retail's caster animations as the 3.3.5 client plays them.
+
+    Retail names a kit's animation directly (SpellVisualAnim's initial and loop ids) or, in most newer
+    spells, through an animation kit: segments played in order, the last one looping
+    (AnimKitSegment). ``pair`` reads either as a start and a loop. ``fit`` makes an id one the client
+    plays: with ``wod`` (WoD character models, which carry retail's ids) an id past 3.3.5's is kept and
+    ``rows`` adds retail's AnimationData rows past 505 so the client walks retail's fallback chain
+    itself; without it the id is followed down that chain here, to one 3.3.5's own models have."""
+
+    def __init__(self, segments: dict, data: dict, wod: bool, have: set[int] | None = None):
+        self.segments, self.data, self.wod = segments, data, wod
+        self.have = have                # the ids every character body in the client has (None: unknown)
+        self.used: set[int] = set()
+
+    def pair(self, a: dict) -> tuple[int | None, int | None]:
+        start = a.get("initial", -1)
+        loop = a.get("loop", -1)
+        if (start is None or start < 0) and (loop is None or loop < 0) and a.get("kit"):
+            segs = sorted(self.segments.get(a["kit"], []))
+            if len(segs) >= 2:
+                start, loop = segs[0][1], segs[-1][1]
+            elif segs:
+                start, loop = -1, segs[0][1]
+        return (start if start is not None and start >= 0 else None,
+                loop if loop is not None and loop >= 0 else None)
+
+    def fit(self, anim: int | None) -> int | None:
+        if anim is None:
+            return None
+        if self.have:
+            # the client's bodies decide: retail's fallback chain down to the first id they all
+            # have (a body lacking an id plays nothing in game, it doesn't fall back by itself)
+            a, seen = anim, set()
+            while a not in self.have and a not in seen:
+                seen.add(a)
+                row = self.data.get(a)
+                if not row:
+                    break
+                a = int(row["Fallback"])
+            if a in self.have:
+                if a == 0 and anim != 0:    # the chain ends on Stand: better no animation
+                    return None
+                if a > MAX_ANIM:
+                    self.used.add(a)
+                return a
+        if anim <= MAX_ANIM:
+            return anim
+        if self.wod:
+            self.used.add(anim)
+            return anim
+        seen = set()
+        while anim > MAX_ANIM and anim not in seen:
+            seen.add(anim)
+            row = self.data.get(anim)
+            if not row:
+                return None
+            anim = row["Fallback"]
+        return anim if 0 < anim <= MAX_ANIM else None
+
+    def rows(self, table) -> int:
+        """Retail's AnimationData rows past the client's into ``table`` (3.3.5's 8 columns: id, name,
+        weapon flags, body flags, flags, fallback, behavior, tier). Weapon, body and flags come from
+        the first 3.3.5 animation down each one's fallback chain. How many were added."""
+        have = {r[0]: r for r in table.records}
+        top = max(have)
+        added = 0
+        for aid in sorted(self.data):
+            if aid <= top:
+                continue
+            r = self.data[aid]
+            base, seen = aid, set()
+            while base not in have and base not in seen and base in self.data:
+                seen.add(base)
+                base = self.data[base]["Fallback"]
+            like = have.get(base) or have[0]
+            table.add_record([aid, table.add_string(f"Retail{aid}"), like[2], like[3], like[4],
+                              int(r["Fallback"]), int(r["BehaviorID"]), int(r["BehaviorTier"])])
+            added += 1
+        return added
 
 
 def moment(start: int, target: int) -> str | None:
@@ -91,7 +199,7 @@ def moment(start: int, target: int) -> str | None:
     return None
 
 
-def plan(visual: dict, timing: dict | None = None) -> dict:
+def plan(visual: dict, timing: dict | None = None, anims: "Anims | None" = None) -> dict:
     """Where each part of a retail visual (SpellIndex.visual) goes in 3.3.5, and what can't.
     ``timing`` (SpellIndex.timing): a ground effect retail plays once near the end of the cast
     (Black Hole's burst, 4.5 s into a 5 s cast) goes to the ground kit of the cast itself."""
@@ -111,7 +219,10 @@ def plan(visual: dict, timing: dict | None = None) -> dict:
                 why = " (it shows on the ground while casting)" if e["start"] == 1 and e["target"] == 3 else ""
                 dropped.append(f"{what}: 3.3.5 has no such moment{why} - {len(e['models'])} model(s) left out")
             continue
-        kit = kits.setdefault(col, {"slots": {}, "specials": [], "anim": None, "events": []})
+        kit = kits.setdefault(col, {"slots": {}, "specials": [], "anim": None, "start_anim": None, "events": [],
+                                    "sound": 0})
+        if not kit["sound"] and e.get("sounds"):
+            kit["sound"] = e["sounds"][0]          # retail SoundKit: a SoundEntries row at install
         kit["events"].append(what)
         if moved_to_cast:
             dropped.append(f"{what}: plays when the cast ends ({cast - late} ms after retail's moment)")
@@ -134,16 +245,28 @@ def plan(visual: dict, timing: dict | None = None) -> dict:
             if m["delay"]:
                 dropped.append(f"{(m['path'] or str(m['fdid'])).split('/')[-1]}: starts {m['delay']} s late in retail")
         for a in e.get("anims", []):
-            anim = a["loop"] if col in ("StateKit", "ChannelKit") and a["loop"] >= 0 else a["initial"] if a["initial"] >= 0 else a["loop"]
-            if anim is None or anim < 0:
+            if anims is None:
+                start = a["initial"] if a["initial"] >= 0 else None
+                loop = a["loop"] if a["loop"] >= 0 else None
+            else:
+                start, loop = anims.pair(a)
+            first, main = (start, loop) if start is not None and loop is not None else (None, loop if loop is not None else start)
+            if main is None or kit["anim"] is not None:
                 continue
-            if anim > MAX_ANIM:
-                dropped.append(f"{what}: animation {anim} is past 3.3.5's ({MAX_ANIM})")
-            elif kit["anim"] is None:
-                kit["anim"] = anim
-        sounds = [o for o in e["other"] if o.startswith("sound")]
-        if sounds:
-            dropped.append(f"{what}: sounds not carried yet")
+            if anims is None:
+                if main > MAX_ANIM:
+                    dropped.append(f"{what}: animation {main} is past 3.3.5's ({MAX_ANIM})")
+                    continue
+                first = first if first is not None and first <= MAX_ANIM else None
+            else:
+                fm, ff = anims.fit(main), anims.fit(first)
+                if fm is None:
+                    dropped.append(f"{what}: animation {main} has no 3.3.5 animation to stand in for it")
+                    continue
+                if fm != main:
+                    dropped.append(f"{what}: animation {main} plays as 3.3.5's {fm}")
+                main, first = fm, ff
+            kit["anim"], kit["start_anim"] = main, first
     missile = None
     if visual["missiles"]:
         m = visual["missiles"][0]
@@ -153,6 +276,26 @@ def plan(visual: dict, timing: dict | None = None) -> dict:
             dropped.append(f"{len(visual['missiles']) - 1} more missile(s): 3.3.5 flies one")
     return {"kits": kits, "missile": missile, "dropped": dropped,
             "names": {c: KIT_NAMES.get(c, c) for c in kits}}
+
+
+TABLE_PATH = "DBFilesClient\\WXLRetailSpellVisuals.txt"
+TABLE_HEADER = ("# wxl.retail-spellvisuals 1: retail spell visuals, tab-separated. Lines belong to the spell above\n"
+                "# them, model lines to the event above them. Times in ms, angles in radians, offsets in yards.\n"
+                "# spell    id  retail_id  cast  duration  speed  launch\n"
+                "# missile  path  attachment  destination  cast_offset(3)  impact_offset(3)  scale  flags  speed\n"
+                "# event    start  end  start_min  start_max  end_min  end_max  target  kit_delay_min  kit_delay_max\n"
+                "# model    path  attachment  offset(3)  yaw  pitch  roll  scale  delay  start_anim  anim  end_anim  alpha  flags  upright\n"
+                "# area     path  per_second  lifetime  scale  flags  (copies scattered over the area while the event lasts)\n"
+                "# glow     fade_in  fade_out  c0(3) c1(3) c2(3)  alpha_middle  alpha_edge  power  halo(3)  halo_px  halo_alpha\n"
+                "#          (the event's unit glows while it lasts: C0 -> C1 -> C2 from its middle to its silhouette)")
+
+
+def _tsv(*values) -> str:
+    def one(v):
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v).replace("\t", " ").replace("\n", " ")
+    return "\t".join(one(v) for v in values)
 
 
 NEW_FLOOR = 200000                  # new spell ids start here (and above any id the client or server has)
@@ -207,6 +350,7 @@ class SpellPort:
     def __init__(self, wb, spells):
         self.wb, self.spells = wb, spells
         self._client_spells: dict[int, str] | None = None
+        self._anim_tables: tuple | None = None
 
     @property
     def dir(self) -> str:
@@ -292,21 +436,128 @@ class SpellPort:
                 sid, nxt = nxt, nxt + 1
             clean.append({"id": sid, "template": tpl, "template_name": names[tpl], "retail": int(e.get("retail") or 0),
                           "visual": int(e.get("visual") or 0), "name": str(e.get("name") or "")[:100] or f"Spell {sid}",
-                          "retail_name": str(e.get("retail_name") or e.get("name") or "")[:100]})
+                          "retail_name": str(e.get("retail_name") or e.get("name") or "")[:100],
+                          "retail_visuals": bool(e.get("retail_visuals", True))}
+                         | ({"mount": dict(e["mount"])} if isinstance(e.get("mount"), dict) else {}))
         self._save("ports.json", clean)
         return clean
+
+    def options(self) -> dict:
+        """Install options: ``wod_models`` -- the client's characters are WoD models, which have
+        retail's newer animations (on by default); ``bfa_bodies`` -- Install puts BfA's character
+        bodies in the client (charport: Data\\patch-I.MPQ), whose animations spells then play."""
+        return {"wod_models": True, "bfa_bodies": False, "fly_everywhere": True} | self._load("options.json", {})
+
+    def set_options(self, opts: dict) -> dict:
+        o = self.options()
+        for k in ("wod_models", "bfa_bodies", "fly_everywhere"):
+            if k in opts:
+                o[k] = bool(opts[k])
+        self._save("options.json", o)
+        return o
+
+    def anims(self, wod: bool | None = None) -> Anims:
+        """The caster-animation resolver (retail's AnimKitSegment and AnimationData, read once)."""
+        if self._anim_tables is None:
+            _key, src = self.spells.source()
+            segs: dict[int, list] = {}
+            for _i, r in src.table("AnimKitSegment"):
+                segs.setdefault(r["ParentAnimKitID"], []).append((r["OrderIndex"], r["AnimID"]))
+            data = {i: r for i, r in src.table("AnimationData")}
+            self._anim_tables = (segs, data)
+        segs, data = self._anim_tables
+        o = self.options()
+        have = self.body_anims(bool(o["bfa_bodies"]))
+        return Anims(segs, data, (o["wod_models"] or o["bfa_bodies"]) if wod is None else wod, have)
+
+    BODY_FOLDERS = ("Human", "Orc", "Dwarf", "NightElf", "Scourge", "Tauren", "Gnome", "Troll", "BloodElf", "Draenei")
+
+    def body_anims(self, bfa: bool) -> set[int] | None:
+        """The animation ids every character body of the client has: BfA's (Data\\patch-I.MPQ) with
+        ``bfa``, else the ones under it. None when no body could be read."""
+        from . import charport as C
+        from ..mpq import MPQ
+        try:
+            cd = ClientData(self.wb.settings.client)
+        except Exception:
+            return None
+        sources = [s for label, s in cd.sources if bfa or C.PATCH_NAME.lower() not in label.lower()]
+        out = None
+        try:
+            for folder in self.BODY_FOLDERS:
+                for sex in ("Male", "Female"):
+                    rel = f"Character\\{folder}\\{sex}\\{folder}{sex}.m2"
+                    data = None
+                    for s in sources:
+                        if isinstance(s, str):
+                            p = os.path.join(s, *rel.split("\\"))
+                            if os.path.isfile(p):
+                                with open(p, "rb") as fh:
+                                    data = fh.read()
+                        elif isinstance(s, MPQ):
+                            data = s.read(rel)
+                        if data:
+                            break
+                    if not data:
+                        continue
+                    base = 8 if data[:4] == b"MD21" else 0
+                    n, o = struct.unpack_from("<II", data, base + 0x1C)
+                    stride = 0x40 if struct.unpack_from("<I", data, base + 4)[0] >= 264 else 0x44
+                    ids = {struct.unpack_from("<H", data, base + o + i * stride)[0] for i in range(n)}
+                    out = ids if out is None else out & ids
+        finally:
+            cd.close()
+        return out
+
+    def add_many(self, spell_ids: list[int], limit: int = 400) -> dict:
+        """New spells from many retail spells at once (a filter's whole list): each with its plain
+        visual, the first 3.3.5 spell suggested for its kind as the one it works like, and its own
+        name. Spells already made, and ones with no visual or no suggestion, are skipped."""
+        idx = self.spells.index()
+        have = {p["retail"] for p in self.ports()}
+        client = self.client_spells()
+        added, skipped = [], []
+        for sid in spell_ids:
+            if len(added) >= limit:
+                skipped.append((sid, "over the limit"))
+                continue
+            if sid in have:
+                skipped.append((sid, "made already"))
+                continue
+            try:
+                d = self.spells.detail(sid)
+            except Exception:
+                skipped.append((sid, "no such spell"))
+                continue
+            vis = next((v for v in d["visual_list"] if not v["difficulty"]), None) or (d["visual_list"] or [None])[0]
+            if not vis:
+                skipped.append((sid, "no visual"))
+                continue
+            tpl = next((t["id"] for t in suggest_templates(vis, idx.timing(sid)) if t["id"] in client), None)
+            if not tpl:
+                skipped.append((sid, "no 3.3.5 spell to work like"))
+                continue
+            added.append({"retail": sid, "retail_name": d["name"], "visual": vis["id"], "template": tpl, "name": d["name"]})
+            have.add(sid)
+        ports = self.set_ports(self.ports() + added) if added else self.ports()
+        return {"added": len(added), "skipped": len(skipped), "ports": ports,
+                "skipped_examples": [f"{idx.names.get(s, s)}: {why}" for s, why in skipped[:8]]}
 
     def preview_plan(self, visual_id: int, spell_id: int = 0) -> dict:
         idx = self.spells.index()
         vis = idx.visual(visual_id)
-        out = plan(vis, idx.timing(spell_id) if spell_id else None)
+        try:
+            anims = self.anims()
+        except Exception:
+            anims = None
+        out = plan(vis, idx.timing(spell_id) if spell_id else None, anims)
         if spell_id:
             out["templates"] = suggest_templates(vis, idx.timing(spell_id))
             out["kind"] = spell_kind(vis, idx.timing(spell_id))
         return out
 
     def state(self) -> dict:
-        return {"ports": self.ports(), "installed": self.installed(), "patch": PATCH_NAME}
+        return {"ports": self.ports(), "installed": self.installed(), "patch": PATCH_NAME, "options": self.options()}
 
     # -- retail's text, cooldowns and icon ---------------------------------------------------
     def _retail(self, src, ids: set[int]) -> dict[int, dict]:
@@ -336,8 +587,11 @@ class SpellPort:
         return out
 
     # -- install -------------------------------------------------------------------------------
-    def install(self, restart: bool = False, say=lambda m: None, dry: bool = False) -> dict:
+    def install(self, restart: bool = False, say=lambda m: None, dry: bool = False, wod: bool | None = None) -> dict:
         from .procs import Restart
+        if wod is not None:
+            self.set_options({"wod_models": wod})
+        anims = self.anims()
         idx = self.spells.index()
         _key, src = self.spells.source()
         cd = self._client()
@@ -432,10 +686,16 @@ class SpellPort:
 
         files: dict[str, bytes] = {}
         exported: dict[int, str] = {}
+        from . import sounds as SND
+        sound_table = D.DBCFile.from_bytes(self._base(cd, SND.TABLE), "SoundEntries.dbc")
+        sounds = SND.SoundPort(src, self.spells.listfile(), sound_table, SND.SPELL_RANGE, cd.exists)
         effect_names: dict[tuple, int] = {}
         stems: set[str] = set()
 
         moved: dict[tuple, str] = {}            # (fdid, offset) -> the .mdx path of a moved copy
+        from . import physics as PH
+        phys_of: dict[int, bytes | None] = {}   # fdid -> its retail .phys
+        phys_rows: list[tuple] = []             # (keys, .phys, shift) for WXLSpellPhysics.phy2
 
         def placed(entry, port_notes) -> str:
             """The model's .mdx path as the kit hangs it: its retail offset moved into the file (a copy
@@ -465,9 +725,12 @@ class SpellPort:
                 moved[key] = base
                 return base
             moved[key] = f"{folder}\\{new_stem}.mdx"
+            if phys_of.get(entry["fdid"]):
+                phys_rows.append(([moved[key]], phys_of[entry["fdid"]], tuple(x / scale for x in off)))
             return moved[key]
 
-        def model(entry, port_notes) -> int:
+        def export(entry, port_notes) -> str:
+            """The model's .mdx path in the patch, exported the first time ('' when it can't be)."""
             fdid = entry["fdid"]
             if fdid not in exported:
                 stem = re.sub(r"[^A-Za-z0-9_]+", "_", os.path.splitext(os.path.basename(entry["path"] or f"model{fdid}"))[0]) or f"model{fdid}"
@@ -480,10 +743,19 @@ class SpellPort:
                 except Exception as e:
                     port_notes.append(f"{entry['path'] or fdid}: not exported ({e})")
                     exported[fdid] = ""
-                    return 0
+                    return ""
                 files.update(ex.files)
                 exported[fdid] = ex.dbc_model_name
-            if not exported[fdid]:
+                try:
+                    phys_of[fdid] = PH.phys_bytes(src.read(fdid), src.read)
+                except Exception:
+                    phys_of[fdid] = None
+                if phys_of[fdid]:
+                    phys_rows.append(([ex.model_path, ex.dbc_model_name], phys_of[fdid], None))
+            return exported[fdid]
+
+        def model(entry, port_notes) -> int:
+            if not export(entry, port_notes):
                 return 0
             path = placed(entry, port_notes)
             key = (path, entry["scale"])
@@ -498,28 +770,47 @@ class SpellPort:
                 effect_names[key] = eid
             return effect_names[key]
 
-        def visual_rows(vis_id: int, port_notes: list, timing: dict | None = None) -> int:
-            pl = plan(idx.visual(vis_id), timing)
-            port_notes.extend(pl["dropped"])
+        def visual_rows(vis_id: int, port_notes: list, timing: dict | None = None, anims_only: bool = False,
+                        channel: bool = False) -> int:
+            """A new SpellVisual for the retail visual. ``anims_only``: the caster's animations alone,
+            for a spell wxl.retail-spellvisuals draws (its models are in the table it reads)."""
+            pl = plan(idx.visual(vis_id), timing, anims)
+            if not anims_only:
+                port_notes.extend(pl["dropped"])
+            # a channelled spell (the 3.3.5 one it works like: Blizzard) plays its channel kit's animation
+            # while it lasts, not its precast kit's: retail's cast animation goes there too
+            if channel and "PrecastKit" in pl["kits"] and "ChannelKit" not in pl["kits"]:
+                pre = pl["kits"]["PrecastKit"]
+                pl["kits"]["ChannelKit"] = {"slots": {}, "specials": [], "anim": pre["anim"], "sound": 0,
+                                            "start_anim": pre.get("start_anim"), "events": list(pre["events"])}
             vrow = [0] * VISUAL_FIELDS
             vid = new("v")
             vrow[0] = vid
             vrow[V["MissileAttachment"]] = 0xFFFFFFFF
             for col, kt in pl["kits"].items():
+                if anims_only:
+                    if kt["anim"] is None and not kt.get("sound"):
+                        continue
+                    kt = kt | {"slots": {}, "specials": []}
                 krow = [0] * KIT_FIELDS
                 kid = new("k")
                 krow[0] = kid
-                krow[K["StartAnimID"]] = NO_ANIM
+                krow[K["StartAnimID"]] = kt["start_anim"] if kt.get("start_anim") is not None else NO_ANIM
                 krow[K["AnimID"]] = kt["anim"] if kt["anim"] is not None else NO_ANIM
                 for k in range(4):
                     krow[K["CharProc"] + k] = NO_ANIM
+                if kt.get("sound"):
+                    try:
+                        krow[K["SoundID"]] = sounds.kit(kt["sound"])
+                    except Exception as e:
+                        port_notes.append(f"sound kit {kt['sound']}: not carried ({e})")
                 for slot, entry in kt["slots"].items():
                     krow[K[slot]] = model(entry, port_notes)
                 for k, entry in enumerate(kt["specials"]):
                     krow[K["SpecialEffect"] + k] = model(entry, port_notes)
                 kits.add_record(krow)
                 vrow[V[col]] = kid
-            if pl["missile"]:
+            if pl["missile"] and not anims_only:
                 m = pl["missile"]
                 eid = model(m, port_notes)
                 if eid:
@@ -533,6 +824,56 @@ class SpellPort:
                         vrow[V["MissileImpactOffset"] + k] = _f(m["impact_offset"][k])
             sv.add_record(vrow)
             return vid
+
+        table: list[str] = [TABLE_HEADER]
+
+        def retail_table(p: dict, t: dict, port_notes: list) -> None:
+            """The retail visual, whole, as wxl.retail-spellvisuals plays it (TABLE_HEADER)."""
+            vis = idx.visual(p["visual"])
+            table.append(_tsv("spell", p["id"], p["retail"], int(t.get("cast", 0)), int(t.get("duration", 0)),
+                              float(t.get("speed", 0) or 0), int(t.get("launch", 0))))
+            for m in vis["missiles"]:
+                path = export(m, port_notes)
+                if path:
+                    table.append(_tsv("missile", path, m["attachment"], m["destination"], *m["cast_offset"],
+                                      *m["impact_offset"], float(m["scale"] or 1), m["flags"],
+                                      float(m["missile_speed"] or 0)))
+            shown = 0
+            for e in vis["events"]:
+                table.append(_tsv("event", e["start"], e["end"], *e["offset"], *e["end_offset"], e["target"],
+                                  *e["kit_delay"]))
+                for m in e["models"]:
+                    path = export(m, port_notes)
+                    if not path:
+                        continue
+                    shown += 1
+                    table.append(_tsv("model", path, m["attachment"], *[float(x) for x in m["offset"]],
+                                      *[float(x) for x in m["rotation"]],
+                                      float((m["scale"] or 1) * (m["attach_scale"] or 1)),
+                                      round(float(m["delay"] or 0) * 1000), *m["anims"],
+                                      float(m["alpha"]) if m["alpha"] else 1.0, m["flags"], int(bool(m.get("upright")))))
+                    if m.get("moving", m["positioner"]):
+                        port_notes.append(f"{(m['path'] or str(m['fdid'])).split('/')[-1]}: moves along a scripted "
+                                          f"path in retail; it stays put here")
+                # what the event's kit does to the unit's own body (Avenging Wrath's golden glow)
+                try:
+                    g = self.wb.creatures.kit_glow(e.get("kit") or 0)
+                except Exception as ex:
+                    g, _ = None, port_notes.append(f"kit {e.get('kit')}: glow not read ({ex})")
+                if g:
+                    table.append(_tsv("glow", round(g["fade"][0] * 1000), round(g["fade"][1] * 1000),
+                                      *[float(x) for c in g["colors"] for x in c], float(g["alphas"][0]),
+                                      float(g["alphas"][1]), float(g["power"]), *[float(x) for x in g["halo"]],
+                                      float(g["halo_width"]), float(g["halo_alpha"])))
+                    port_notes.append(f"body glow on the {'caster' if e['target'] == 1 else 'target'}")
+                for a in e.get("area_models", []):
+                    path = export(a, port_notes)
+                    if path:
+                        shown += 1
+                        table.append(_tsv("area", path, float(a["rate"]), int(a["lifetime"]), float(a["scale"] or 1),
+                                          int(a["flags"])))
+            port_notes.append(f"retail visuals: {shown} model(s) and {len(vis['missiles'])} missile(s), "
+                              f"drawn by wxl.retail-spellvisuals")
 
         retail = self._retail(src, {p["retail"] for p in ports}) if ports else {}
         icon_fdids = {idx.misc.get(p["retail"], (0,) * 7)[6] for p in ports} - {0}
@@ -573,7 +914,11 @@ class SpellPort:
             t = idx.timing(p["retail"])
             r = retail.get(p["retail"], {})
             misc = idx.misc.get(p["retail"], (0,) * 7)
-            vid = visual_rows(p["visual"], pn, t) if p["visual"] else 0
+            use_mod = p.get("retail_visuals", True) and bool(p["visual"])
+            channel = bool(LS.get(list(struct.unpack(f"<{SPELL_FIELDS}I", tpl_rec)), "AttributesEx") & (0x4 | 0x40))
+            vid = visual_rows(p["visual"], pn, t, anims_only=use_mod, channel=channel) if p["visual"] else 0
+            if use_mod:
+                retail_table(p, t, pn)
             iid = icon(misc[6], pn)
 
             def build(rec: bytes, table: D.RawDBC) -> list[int]:
@@ -613,6 +958,18 @@ class SpellPort:
                 LS.set(row, "SpellLevel", 1)
                 LS.set(row, "BaseLevel", 1)
                 LS.set(row, "MaxLevel", 0)
+                mount = p.get("mount")
+                if mount:
+                    # a mount (the Mounts page): the mounted aura shows its creature, the speed auras its
+                    # speeds (base points: % faster - 1, as 3.3.5's own mount spells have them)
+                    for k in range(3):
+                        aura = LS.get(row, "EffectAura", k)
+                        if aura == 78:
+                            LS.set(row, "EffectMiscValue", int(mount.get("entry") or 0), k)
+                        elif aura == 32:
+                            LS.set(row, "EffectBasePoints", int(mount.get("ground") or 99) & 0xFFFFFFFF, k)
+                        elif aura == 207:
+                            LS.set(row, "EffectBasePoints", int(mount.get("flying") or 279) & 0xFFFFFFFF, k)
                 return row
 
             spell.add_row(build(tpl_rec, spell))
@@ -627,6 +984,32 @@ class SpellPort:
                 pn.append(f"the template triggers spell(s) {', '.join(str(x) for x in trig if x)}: those keep their own look")
             made.append(p)
 
+        if len(table) > 1:
+            files[TABLE_PATH] = ("\n".join(table) + "\n").encode("utf-8")
+        if anims.wod and anims.used:
+            # the client plays ids past 505 only with their rows (its fallback walk reads them)
+            adata = D.DBCFile.from_bytes(self._base(cd, "DBFilesClient\\AnimationData.dbc"), "AnimationData.dbc")
+            if adata.field_count == 8:
+                n = anims.rows(adata)
+                files["DBFilesClient\\AnimationData.dbc"] = adata.to_bytes()
+                say(f"AnimationData: {n} retail animation(s) past 3.3.5's for the WoD character models")
+            else:
+                notes_all = (notes_all + "; " if notes_all else "") + \
+                    f"the client's AnimationData.dbc has {adata.field_count} fields: retail's newer animations left out"
+        if sounds.made:
+            files.update(sounds.files)
+            files[SND.TABLE] = sound_table.to_bytes()
+            say(f"sounds: {len([x for x in sounds.made.values() if x])} retail sound kit(s), {len(sounds.files)} file(s)")
+        if phys_rows:
+            try:
+                table, pnotes = PH.table(self.wb.kit.cfg.tools, phys_rows)
+                for n in pnotes:
+                    say(f"  {n}")
+                if table:
+                    files[PH.SPELL_TABLE] = table
+                    say(f"physics: {len(phys_rows)} spell model(s) (wings, ribbons) move live with Equip Plus")
+            except Exception as e:
+                say(f"spell physics left out: {type(e).__name__}: {e}")
         files["DBFilesClient\\Spell.dbc"] = spell.to_bytes()
         files["DBFilesClient\\SpellVisual.dbc"] = sv.to_bytes()
         files["DBFilesClient\\SpellVisualKit.dbc"] = kits.to_bytes()
@@ -634,13 +1017,30 @@ class SpellPort:
         files["DBFilesClient\\SpellIcon.dbc"] = icons.to_bytes()
         for tname, t in small.items():
             files[f"DBFilesClient\\{tname}.dbc"] = t.to_bytes()
+        fly = self.options().get("fly_everywhere", True)
+        server_area = None
+        if fly:
+            files["DBFilesClient\\AreaTable.dbc"], n = fly_everywhere(self._base(cd, "DBFilesClient\\AreaTable.dbc"))
+            say(f"flying everywhere: {n} area(s) of the four continents made flyable (Dalaran too)")
+        if server_dbc and os.path.isdir(server_dbc):
+            # the server's own table as it was before this tool first changed it
+            kept = os.path.join(self.dir, "server-base", "AreaTable.dbc")
+            live = os.path.join(server_dbc, "AreaTable.dbc")
+            if not os.path.isfile(kept) and os.path.isfile(live):
+                os.makedirs(os.path.dirname(kept), exist_ok=True)
+                shutil.copy2(live, kept)
+            if os.path.isfile(kept):
+                with open(kept, "rb") as fh:
+                    base = fh.read()
+                server_area = fly_everywhere(base)[0] if fly else base
 
         def result(extra):
             return {"ok": True, "patch": PATCH_NAME, "server": bool(server),
                     "spells": [p | {"notes": notes.get(p["id"], [])} for p in ports], "made": len(made),
                     "models": len([x for x in exported.values() if x]), "note": notes_all} | extra
         if dry:
-            return result({"dry": True, "files": {k: len(v) for k, v in files.items()}})
+            return result({"dry": True, "files": {k: len(v) for k, v in files.items()},
+                           "table": files.get(TABLE_PATH, b"").decode("utf-8")})
 
         rs = None
         if restart:
@@ -666,6 +1066,7 @@ class SpellPort:
             elif os.path.isfile(patch):
                 os.remove(patch)
                 say(f"Data\\{PATCH_NAME} removed: no new spells left")
+            self._bodies(client, say)
             if server:
                 for tname in SERVER_TABLES:
                     dest = os.path.join(server_dbc, f"{tname}.dbc")
@@ -673,6 +1074,14 @@ class SpellPort:
                         shutil.copy2(dest, os.path.join(backup_dir, f"server-{tname}.dbc"))
                     server[tname].save(dest)
                 say(f"server: {len(made)} new spell(s) in {server_dbc}")
+            if server_area is not None:
+                dest = os.path.join(server_dbc, "AreaTable.dbc")
+                if os.path.isfile(dest):
+                    shutil.copy2(dest, os.path.join(backup_dir, "server-AreaTable.dbc"))
+                with open(dest + ".part", "wb") as fh:
+                    fh.write(server_area)
+                os.replace(dest + ".part", dest)
+                say("server: AreaTable.dbc " + ("flyable everywhere" if fly else "back to its own"))
             cache = os.path.join(client, "Cache")
             if os.path.isdir(cache):
                 shutil.rmtree(cache, ignore_errors=True)
@@ -683,6 +1092,31 @@ class SpellPort:
         shadow = [s for s in (cd.shadowed_by(f"DBFilesClient\\{t}.dbc") for t in
                               ("Spell", "SpellVisual", "SpellVisualKit", "SpellVisualEffectName", "SpellIcon")) if s]
         return result({"restarted": started, "shadowed": sorted(set(shadow))})
+
+    def _bodies(self, client: str, say) -> None:
+        """BfA's character bodies in or out of the client, as the option says. Built only when they
+        are missing or an older export made them: twenty bodies take a few minutes."""
+        from . import charport as C
+        o = self.options()
+        patch = os.path.join(client, "Data", C.PATCH_NAME)
+        if not o["bfa_bodies"]:
+            if C.remove(client):
+                say(f"Data\\{C.PATCH_NAME} removed: the client's own character bodies are back")
+            if o.get("bodies_built"):
+                self._save("options.json", {k: v for k, v in o.items() if k != "bodies_built"})
+            return
+        if os.path.isfile(patch) and o.get("bodies_built") == C.BODIES_VERSION:
+            return
+        bodies = getattr(self.wb, "bodies", None)
+        if bodies is None:
+            say("BfA character bodies need BfA's data: add the BfA source in Settings")
+            return
+        exports, notes = C.export_all(bodies, client, say)
+        for n in notes:
+            say(n)
+        if exports:
+            C.install(client, exports, say)
+            self._save("options.json", o | {"bodies_built": C.BODIES_VERSION})
 
     def _server_bases(self, server_dbc: str) -> dict | None:
         """The server's spell tables as they were before this tool first wrote them (kept in

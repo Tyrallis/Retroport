@@ -38,6 +38,25 @@ function el(tag, attrs = {}, ...kids) {
   for (const kid of kids.flat()) if (kid != null && kid !== false) e.append(kid.nodeType ? kid : document.createTextNode(kid));
   return e;
 }
+// HTML from outside (Wowhead's tooltips) as nodes with formatting only: tables, text and line breaks,
+// each element its class and nothing else; links become plain text, anything else its text.
+const SAFE_TAGS = new Set(["B", "I", "BR", "DIV", "SPAN", "TABLE", "TBODY", "TR", "TD", "TH", "SMALL", "UL", "LI", "P"]);
+function safeHtml(html) {
+  const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+  const copy = n => {
+    if (n.nodeType === 3) return document.createTextNode(n.textContent);
+    if (n.nodeType !== 1) return null;
+    const kids = [...n.childNodes].map(copy).filter(Boolean);
+    if (!SAFE_TAGS.has(n.tagName)) { const f = document.createDocumentFragment(); f.append(...kids); return f; }
+    const e = document.createElement(n.tagName);
+    if (n.className) e.className = String(n.className).replace(/[^\w\- ]/g, "");
+    e.append(...kids);
+    return e;
+  };
+  const out = document.createDocumentFragment();
+  out.append(...[...doc.body.childNodes].map(copy).filter(Boolean));
+  return out;
+}
 function qcolor(q) { return (S.meta && S.meta.qualities[q]) ? S.meta.qualities[q].color : "#ffffff"; }
 function icon(fdid, quality, size = "", source = S.source) {
   const box = el("span", {class: "icon " + size, style: `border-color:${quality != null ? qcolor(quality) : "#444"}`});
@@ -1139,6 +1158,7 @@ function show(view) {
   if (view === "settings") openSettings();
   if (view === "stats") loadStats();
   if (view === "creatures" && typeof crShow === "function") crShow();
+  if (view === "mounts" && typeof mtShow === "function") mtShow();
   if (view === "spells" && typeof spShow === "function") spShow();
   $("#q").placeholder = view === "sets" ? "Search sets by name, version or group   ( / )" : "Search items by name or id   ( / )";
 }

@@ -199,6 +199,7 @@ class CreatureIndex:
                 "model": model["f"], "model_data": d["m"], "path": path, "stem": _stem_of(path, f"display{did}"),
                 "scale": d["s"], "alpha": d["a"], "textures": [t for t in d["t"] if t], "t": list(d["t"]),
                 "humanoid": bool(d["x"]), "geo": model["geo"], "model_scale": model["scale"],
+                "mount_height": model.get("mount", 0.0),
                 "collision": [model["cw"], model["ch"]]}
 
     def variations(self, did: int) -> list[dict]:
@@ -352,6 +353,191 @@ def _texture_users(md20: bytes) -> dict[int, set]:
     return users
 
 
+def _neutral(img) -> bool:
+    """A texture that only fades or brightens what it multiplies: near white and unsaturated where
+    it is not transparent (Blizzard's fade bands under a colour layer)."""
+    px = [p for p in img.convert("RGBA").resize((32, 32)).getdata() if p[3] > 16]
+    if not px:
+        return True
+    bright = sum(max(p[:3]) for p in px) / (255.0 * len(px))
+    sat = sum((max(p[:3]) - min(p[:3])) / max(1, max(p[:3])) for p in px) / len(px)
+    return bright > 0.7 and sat < 0.15
+
+
+def bake_projected(m2: bytes, skins: dict[str, bytes], files: dict[str, bytes], tex_file: dict[int, str]) -> list[str]:
+    """A batch flagged projected (0x4) is laid onto the terrain by the client, which projects one
+    texture -- its first, mapped as the batch's first UVs map it -- over the ground under it. Retail's
+    projected batches combine two or three (a colour, a detail layer, a shape mask on the second
+    UVs). So the others are baked into the first texture's image, each sampled where the batch's
+    second UVs put it, combined as the batch's packed shader says (op 3 adds, op 1 multiplies, the
+    rest multiply twice), the third multiplying colour and alpha; the batch becomes one texture.
+    The layers' scrolling stops. Only a first texture no other batch reads is rewritten. Skins are
+    changed in ``skins`` (path -> bytes); returns notes."""
+    from PIL import Image
+    from ..formats import blp
+    md20 = _chunks(m2).get("MD21", b"")
+    if len(md20) < 0x130:
+        return []
+    tn, to = struct.unpack_from("<II", md20, 0x80)
+    look = list(struct.unpack_from(f"<{tn}h", md20, to)) if tn else []
+    vn, vo = struct.unpack_from("<II", md20, 0x3C)
+    notes, baked = [], set()
+    users: dict[int, int] = {}
+    parsed = {}
+    for path, skin in skins.items():
+        if len(skin) < 0x2C:
+            continue
+        bn, bo = struct.unpack_from("<II", skin, 4 + 8 * 4)
+        rows = [struct.unpack_from("<BbHHHhHHHHHHH", skin, bo + k * 0x18) for k in range(bn)]
+        parsed[path] = (bo, rows)
+    # who reads each texture: the first skin is the whole model (the others are its lower details)
+    for r in (parsed[min(parsed)][1] if parsed else []):
+        for k in range(r[8]):
+            if r[9] + k < tn:
+                users[look[r[9] + k]] = users.get(look[r[9] + k], 0) + 1
+    baked_combos: set[int] = set()
+    for path, (bo, rows) in parsed.items():
+        skin = bytearray(skins[path])
+        vi_n, vi_o = struct.unpack_from("<II", skin, 4)
+        sm_n, sm_o = struct.unpack_from("<II", skin, 4 + 8 * 3)
+        for k, (flags, _p, shader, sub, _g, _c, _m, _l, tcount, tcombo, _tc, _w, _tt) in enumerate(rows):
+            if not (flags & 4) or tcount < 2 or shader & 0x8000 or tcombo + tcount > tn or sub >= sm_n:
+                continue
+            if tcombo in baked_combos:                 # baked already, from another skin
+                struct.pack_into("<H", skin, bo + k * 0x18 + 0x0E, 1)
+                continue
+            first = look[tcombo]
+            if first in baked or users.get(first, 0) > 1 + (look[tcombo + 1] == first) or first not in tex_file:
+                continue
+            vstart, vcount = struct.unpack_from("<HH", skin, sm_o + sub * 0x30 + 4)
+            if vcount < 3:
+                continue
+            uv = []
+            for j in range(3):
+                v = struct.unpack_from("<H", skin, vi_o + 2 * (vstart + j))[0]
+                uv.append((struct.unpack_from("<2f", md20, vo + v * 48 + 32), struct.unpack_from("<2f", md20, vo + v * 48 + 40)))
+            # the affine map from the first UVs to the second, from the batch's first three vertices
+            (a0, a1), (b0, b1), (c0, c1) = uv
+            d = (b0[0] - a0[0]) * (c0[1] - a0[1]) - (c0[0] - a0[0]) * (b0[1] - a0[1])
+            if abs(d) < 1e-9:
+                continue
+
+            def second(u, w):
+                s = ((u - a0[0]) * (c0[1] - a0[1]) - (c0[0] - a0[0]) * (w - a0[1])) / d
+                t = ((b0[0] - a0[0]) * (w - a0[1]) - (u - a0[0]) * (b0[1] - a0[1])) / d
+                return (a1[0] + s * (b1[0] - a1[0]) + t * (c1[0] - a1[0]),
+                        a1[1] + s * (b1[1] - a1[1]) + t * (c1[1] - a1[1]))
+            try:
+                base = blp.decode_bytes(files[tex_file[first]]).convert("RGBA")
+                layers = []
+                for j in range(1, tcount):
+                    idx = look[tcombo + j]
+                    if idx not in tex_file:
+                        raise ValueError(f"layer {idx} has no file")
+                    layers.append(blp.decode_bytes(files[tex_file[idx]]).convert("RGBA"))
+            except Exception as e:
+                notes.append(f"projected batch {k}: not baked ({e})")
+                continue
+            W, H = base.size
+            on_second = bool(shader & 0x4000)
+            op = shader & 0x7
+            bp = base.load()
+            lp = [(l.load(), l.size) for l in layers]
+            out = Image.new("RGBA", (W, H))
+            op_px = out.load()
+
+            def sample(px, size, u, w):
+                x = int((u % 1.0) * size[0]) % size[0]
+                y = int((w % 1.0) * size[1]) % size[1]
+                return px[x, y]
+            for y in range(H):
+                for x in range(W):
+                    u, w = (x + 0.5) / W, (y + 0.5) / H
+                    r, g, b, a = (c / 255.0 for c in bp[x, y])
+                    su, sw = second(u, w) if on_second else (u, w)
+                    for j, (px, size) in enumerate(lp):
+                        lr, lg, lb, la = (c / 255.0 for c in sample(px, size, su, sw))
+                        if j == 0 and op == 3:          # adds
+                            r, g, b = r + lr * la, g + lg * la, b + lb * la
+                        elif j == 0 and op == 1:        # multiplies
+                            r, g, b, a = r * lr, g * lg, b * lb, a * la
+                        elif j == 0:                    # multiplies twice (Mod2x, its no-alpha form keeps alpha)
+                            r, g, b = r * lr * 2, g * lg * 2, b * lb * 2
+                            if op != 6:
+                                a = a * la * 2
+                        else:                           # the mask: nothing past its edges
+                            if not (0.0 <= su <= 1.0 and 0.0 <= sw <= 1.0):
+                                lr = lg = lb = la = 0.0
+                            r, g, b, a = r * lr, g * lg, b * lb, a * la
+                    op_px[x, y] = tuple(int(max(0.0, min(1.0, c)) * 255) for c in (r, g, b, a))
+            files[tex_file[first]] = blp.encode_dxt(out, alpha=True)
+            struct.pack_into("<H", skin, bo + k * 0x18 + 0x0E, 1)
+            baked.add(first)
+            baked_combos.add(tcombo)
+            notes.append(f"projected batch {k}: {tcount} textures baked into {first} (laid onto the terrain)")
+        skins[path] = bytes(skin)
+    return notes
+
+
+def colour_before_fade(m2: bytes, skins: list[bytes], files: dict[str, bytes], tex_file: dict[int, str]) -> tuple[bytes, list[str]]:
+    """Retail draws some batches from three textures; the 3.3.5 client (through wxl.modern-m2) keeps
+    the first and the third, the mask. Where the first is only a white fade band and the second
+    carries the colour (a dark void under a swirl mask), the two swap places in the batch's texture
+    and transform lookups, so the colour survives. Only lookup entries no other batch reads differently
+    are swapped. Returns the model and notes."""
+    from ..formats import blp
+    pos = 0
+    md = None
+    while pos + 8 <= len(m2):
+        tag, size = m2[pos:pos + 4], struct.unpack_from("<I", m2, pos + 4)[0]
+        if tag == b"MD21":
+            md = pos + 8
+            break
+        pos += 8 + size
+    if md is None:
+        return m2, []
+    out = bytearray(m2)
+    tn, to = struct.unpack_from("<II", out, md + 0x80)
+    xn, xo = struct.unpack_from("<II", out, md + 0x98)
+    look = list(struct.unpack_from(f"<{tn}h", out, md + to)) if tn else []
+    # every batch's (texture start, count, transform start), over every skin
+    batches = []
+    for skin in skins:
+        if len(skin) < 0x2C:
+            continue
+        bn, bo = struct.unpack_from("<II", skin, 4 + 8 * 4)
+        for k in range(bn):
+            shader, = struct.unpack_from("<H", skin, bo + k * 0x18 + 2)
+            tcount, tcombo = struct.unpack_from("<HH", skin, bo + k * 0x18 + 0x0E)
+            ttrans, = struct.unpack_from("<H", skin, bo + k * 0x18 + 0x16)
+            batches.append((shader, tcount, tcombo, ttrans))
+    notes, done = [], set()
+    for shader, tcount, tcombo, ttrans in batches:
+        if tcount != 3 or shader & 0x8000 or tcombo in done or tcombo + 2 >= tn:
+            continue
+        done.add(tcombo)
+        # nobody else may read these two entries as anything but this batch's first two
+        if any((t != tcombo or c != 3) and t <= tcombo + 1 and tcombo < t + c for s, c, t, x in batches):
+            continue
+        a, b = look[tcombo], look[tcombo + 1]
+        if a == b or a not in tex_file or b not in tex_file:
+            continue
+        try:
+            fade = _neutral(blp.decode_bytes(files[tex_file[a]]))
+            colour = not _neutral(blp.decode_bytes(files[tex_file[b]]))
+        except Exception:
+            continue
+        if not (fade and colour):
+            continue
+        struct.pack_into("<hh", out, md + to + 2 * tcombo, b, a)
+        if ttrans != 0xFFFF and ttrans + 1 < xn and \
+                not any((x != ttrans or c != 3) and x <= ttrans + 1 and ttrans < x + c for s, c, t, x in batches):
+            x0, x1 = struct.unpack_from("<hh", out, md + xo + 2 * ttrans)
+            struct.pack_into("<hh", out, md + xo + 2 * ttrans, x1, x0)
+        notes.append(f"three-texture batch: colour layer {b} put before fade layer {a} (the client keeps two)")
+    return bytes(out), notes
+
+
 def bake_multitex_particles(m2: bytes, files: dict[str, bytes], tex_file: dict[int, str]) -> list[str]:
     """The 3.3.5 client draws one texture per particle; a modern multi-texture emitter multiplies its
     first layer (often a white shape mask) by two more (e.g. dark scrolling clouds). Bake those two into
@@ -392,8 +578,14 @@ def bake_multitex_particles(m2: bytes, files: dict[str, bytes], tex_file: dict[i
                 for y in range(0, base.height, ch):
                     for x in range(0, base.width, cw):
                         sheet.paste(cell, (x, y))
-                # each layer modulates at 2x, as the client's own two-texture combiners do
-                rgb = ImageChops.multiply(rgb, sheet).point(lambda v: min(255, v * 2))
+                # a patterned layer modulates at 2x, as the client's own two-texture combiners do; a
+                # flat one (Blizzard's 8x8 white or grey) is a plain tint -- doubled, white blows the
+                # particle out to a white square
+                lo, hi = zip(*cell.getextrema())
+                flat = max(hi) - min(lo) <= 8
+                rgb = ImageChops.multiply(rgb, sheet)
+                if not flat:
+                    rgb = rgb.point(lambda v: min(255, v * 2))
             baked = Image.merge("RGBA", (*rgb.split(), base.getchannel("A")))
             files[path] = blp.encode_dxt(baked, alpha=True)
             notes.append(f"particle texture {tex}: layers {layers[0]} and {layers[1]} baked in (they no longer scroll)")
@@ -402,12 +594,68 @@ def bake_multitex_particles(m2: bytes, files: dict[str, bytes], tex_file: dict[i
     return notes
 
 
+def bake_multitex_ribbons(m2: bytes, files: dict[str, bytes], tex_file: dict[int, str]) -> tuple[bytes, list[str]]:
+    """Retail gives a ribbon several textures: a base streak and masks multiplied over it (a noise
+    that breaks the trail into sparkles). The 3.3.5 client draws a ribbon once per texture it names,
+    added on top of each other: the masks come out as wide bright bands (Blizzard's falling shards
+    leave white beams). So each ribbon keeps its first texture alone, the masks multiplied into it
+    (2x for a patterned one, as the particle bake does) where no batch or particle reads that image.
+    Their scrolling is lost. Returns the model and notes."""
+    from PIL import Image, ImageChops
+    from ..formats import blp
+    pos, md = 0, None
+    while pos + 8 <= len(m2):
+        tag, size = m2[pos:pos + 4], struct.unpack_from("<I", m2, pos + 4)[0]
+        if tag == b"MD21":
+            md = pos + 8
+            break
+        pos += 8 + size
+    if md is None:
+        return m2, []
+    out = bytearray(m2)
+    users = _texture_users(bytes(out[md:]))
+    n, off = struct.unpack_from("<II", out, md + 0x120)
+    notes, baked = [], set()
+    for k in range(n):
+        at = md + off + 0xB0 * k + 0x14
+        tn, to = struct.unpack_from("<II", out, at)
+        if tn < 2 or md + to + 2 * tn > len(out):
+            continue
+        idx = [struct.unpack_from("<H", out, md + to + 2 * j)[0] for j in range(tn)]
+        base, layers = idx[0], []
+        for t in idx[1:]:
+            if t != base and t not in layers:
+                layers.append(t)
+        struct.pack_into("<I", out, at, 1)              # the ribbon draws once, with its base texture
+        path = tex_file.get(base)
+        if base in baked or not path or path not in files or users.get(base, set()) - {"ribbon"}:
+            notes.append(f"ribbon {k}: drawn with its first texture only")
+            continue
+        try:
+            img = blp.decode_bytes(files[path]).convert("RGBA")
+            rgb = img.convert("RGB")
+            for t in layers:
+                if t not in tex_file or tex_file[t] not in files:
+                    continue
+                layer = blp.decode_bytes(files[tex_file[t]]).convert("RGB").resize(img.size, Image.LANCZOS)
+                lo, hi = zip(*layer.getextrema())
+                rgb = ImageChops.multiply(rgb, layer)
+                if max(hi) - min(lo) > 8:
+                    rgb = rgb.point(lambda v: min(255, v * 2))
+            files[path] = blp.encode_dxt(Image.merge("RGBA", (*rgb.split(), img.getchannel("A"))), alpha=True)
+            baked.add(base)
+            notes.append(f"ribbon {k}: texture layers {layers} baked into its first (they no longer scroll)")
+        except Exception as e:
+            notes.append(f"ribbon {k}: drawn with its first texture only ({e})")
+    return bytes(out), notes
+
+
 class Export:
     """A display's files, as the client and the mod will look for them."""
 
-    def __init__(self, stem: str, root: str = ROOT):
+    def __init__(self, stem: str, root: str = ROOT, folder: str | None = None):
         self.stem = stem
-        self.folder = f"{root}\\{stem}"
+        self.folder = folder or f"{root}\\{stem}"
         self.files: dict[str, bytes] = {}
         self.notes: list[str] = []
         self.variations = ["", "", ""]
@@ -428,10 +676,10 @@ class Export:
         self.files[f"{self.folder}\\{name}"] = data
 
 
-def export_display(read, row: dict, stem: str, root: str = ROOT) -> Export:
+def export_display(read, row: dict, stem: str, root: str = ROOT, folder: str | None = None) -> Export:
     """Every file the client needs for this display (``row`` as CreatureIndex.row gives it; a spell
-    model passes {"model": fdid} and its own ``root``)."""
-    ex = Export(stem, root)
+    model passes {"model": fdid} and its own ``root``; a character body its game ``folder``)."""
+    ex = Export(stem, root, folder)
     m2 = read(row["model"])
     if m2[:4] != b"MD21":
         raise CreatureError(f"model {row['model']} is not a chunked (MD21) model; nothing modern to port")
@@ -526,6 +774,18 @@ def export_display(read, row: dict, stem: str, root: str = ROOT) -> Export:
     tex_file = {i: f"{ex.folder}\\{names[f]}.blp" for i, f in enumerate(_u32s(ch.get("TXID", b"")))
                 if f and names.get(f)}
     ex.notes += bake_multitex_particles(m2, ex.files, tex_file)
+    skin_files = {k: v for k, v in ex.files.items() if k.startswith(f"{ex.folder}\\{stem}") and k.endswith(".skin")}
+    ex.notes += bake_projected(m2, skin_files, ex.files, tex_file)
+    ex.files.update(skin_files)
+    skins = list(skin_files.values())
+    m2, swapped = colour_before_fade(m2, skins, ex.files, tex_file)
+    if swapped:
+        ex.put(f"{stem}.m2", m2)
+        ex.notes += swapped
+    m2, ribbons = bake_multitex_ribbons(m2, ex.files, tex_file)
+    if ribbons:
+        ex.put(f"{stem}.m2", m2)
+        ex.notes += ribbons
     fourth = row_fourth_texture(row)
     if fourth and texture(fourth):
         m2, baked = bake_texture_type(m2, FOURTH_SKIN_TYPE, fourth)
@@ -655,7 +915,7 @@ def add_rows(md: D.DBCFile, di: D.DBCFile, ids: dict, ex: Export, c: dict) -> No
     md.add_record([
         ids["model"], 0, md.add_string(ex.dbc_model_name), 1, F(float(c.get("model_scale") or 1.0)),
         1, 0, F(12.0), F(10.0), F(1.0), 0, 0, 0, 0,
-        F(float(cw) or 0.6), F(float(chh) or 2.2), F(1.87),
+        F(float(cw) or 0.6), F(float(chh) or 2.2), F(float(c.get("mount_height") or 1.87)),
         F(g[0]), F(g[1]), F(g[2]), F(g[3]), F(g[4]), F(g[5]),
         F(1.0), F(1.0), 0, 0, 0,
     ])
@@ -785,7 +1045,134 @@ class Creatures:
             elif "SKID" in _chunks(data):
                 notes.append("Its skeleton lives in a .skel file: Install makes it self-contained for the client.")
             self._meshes[k] = {"mesh": M.mesh(src.read, row["model"], textures_of(row)), "notes": notes}
-        return {"display": did, "source": key, "row": row} | self._meshes[k]
+        return {"display": did, "source": key, "row": row, "glow": self.glow(did),
+                "state_models": self.state_models(did)} | self._meshes[k]
+
+    def state_models(self, did: int) -> list[dict]:
+        """The models the display's state kit hangs on the creature for good (a red ghost's fog, a
+        demon's fel flames): {fdid, attachment, scale, offset}."""
+        self.glow(did)
+        state, kits = self._glow_tables[0], self._glow_tables[1]
+        ma, en = self._glow_tables[6], self._glow_tables[7]
+        out = []
+        for kind, eid in kits.get(state.get(did, 0), []):
+            if kind == 2 and eid in ma:
+                a = ma[eid]
+                fd = int((en.get(a.get("SpellVisualEffectNameID")) or {}).get("ModelFileDataID") or 0)
+                if fd:
+                    out.append({"fdid": fd, "attachment": int(a.get("AttachmentID", -1)),
+                                "scale": float(a.get("Scale") or 1.0) * float((en.get(a.get("SpellVisualEffectNameID")) or {}).get("Scale") or 1.0),
+                                "offset": list(a.get("Offset") or [0, 0, 0])})
+        return out
+
+    def glow(self, did: int) -> dict | None:
+        """The display's state effects that colour the creature itself (its StateSpellVisualKit):
+        GradientEffect (kit effect 16: a glow ramping through three colours toward its silhouette, and
+        an edge colour) and OutlineEffect (9: an outline in a HighlightColor). For the viewer's glow
+        option; None when it has neither."""
+        if not hasattr(self, "_glow_tables"):
+            _key, src = self.source()
+            state = {i: int(r.get("StateSpellVisualKitID") or 0) for i, r in src.table("CreatureDisplayInfo")
+                     if r.get("StateSpellVisualKitID")}
+            kits: dict[int, list] = {}
+            for _i, r in src.table("SpellVisualKitEffect"):
+                if r["EffectType"] in (2, 7, 9, 12, 16):
+                    kits.setdefault(r["ParentSpellVisualKitID"], []).append((r["EffectType"], r["Effect"]))
+            grad = dict(src.table("GradientEffect"))
+            outl = dict(src.table("OutlineEffect"))
+            hl = dict(src.table("HighlightColor"))
+            shad = dict(src.table("ShadowyEffect"))
+            wanted = {e for v in kits.values() for t, e in v if t == 2}
+            ma = {i: r for i, r in src.table("SpellVisualKitModelAttach") if i in wanted}
+            names = {r.get("SpellVisualEffectNameID") for r in ma.values()}
+            en = {i: r for i, r in src.table("SpellVisualEffectName") if i in names}
+            edge = dict(src.table("EdgeGlowEffect"))
+            self._glow_tables = (state, kits, grad, outl, hl, shad, ma, en, edge)
+        state, kits, grad, outl, hl, shad = self._glow_tables[:6]
+        out = {}
+
+        def argb(v):
+            v = int(v or 0) & 0xFFFFFFFF
+            return [(v >> 16 & 255) / 255, (v >> 8 & 255) / 255, (v & 255) / 255]
+        for kind, eid in kits.get(state.get(did, 0), []):
+            if kind == 7 and eid in shad and "colors" not in out:
+                # ShadowyEffect: a rim of its primary colour (Fel Corruption's green), its inner and outer
+                # strengths how much it fills the body and how bright its edge is
+                s = shad[eid]
+                c = argb(s.get("PrimaryColor"))
+                if any(c):
+                    inner = float(s.get("InnerStrength") or 1.0)
+                    outer = float(s.get("OuterStrength") or 1.0)
+                    out["colors"] = [[x * 0.15 for x in c], [x * 0.6 for x in c], c]
+                    out["alphas"] = [min(1.0, 0.25 * inner), min(1.0, 0.9 * outer)]
+                    out.setdefault("edge", c)
+                continue
+            if kind == 16 and eid in grad:
+                g = grad[eid]
+                rgb = lambda p: [float(g.get(f"{p}_r") or 0), float(g.get(f"{p}_g") or 0), float(g.get(f"{p}_b") or 0)]
+                out["colors"] = [rgb("Colors0"), rgb("Colors1"), rgb("Colors2")]
+                out["alphas"] = [float(g.get("Alpha1") or 0.5), float(g.get("Alpha2") or 0.8)]
+                edge = rgb("EdgeColor")
+                if any(edge):
+                    out["edge"] = edge
+            elif kind == 9 and eid in outl:
+                c = hl.get(int(outl[eid].get("HighlightColorID") or 0)) or {}
+                out.setdefault("edge", argb(c.get("StartColor") if c.get("StartColor") is not None else -1))
+        return out or None
+
+    def kit_glow(self, kit: int) -> dict | None:
+        """What a spell visual kit does to the unit's own body, as one set of numbers the game
+        (wxl.retail-spellvisuals) and the preview both draw: a fresnel ramp over the body from its
+        middle to its silhouette (``colors`` C0 -> C1 -> C2, ``alphas`` middle and edge, ``power`` the
+        ramp's exponent) and a halo just outside it (``halo`` colour, ``halo_width`` pixels,
+        ``halo_alpha``), fading in and out over ``fade`` seconds. From EdgeGlowEffect (12: Avenging
+        Wrath's gold, Bestial Wrath's red), ShadowyEffect (7: Combustion), GradientEffect (16) and
+        OutlineEffect (9). None for a kit that does none of these."""
+        self.glow(0)                                      # loads the tables
+        _state, kits, grad, outl, hl, shad, _ma, _en, edge = self._glow_tables
+
+        def argb(v):
+            v = int(v or 0) & 0xFFFFFFFF
+            return [(v >> 16 & 255) / 255, (v >> 8 & 255) / 255, (v & 255) / 255]
+        out: dict = {}
+        for kind, eid in kits.get(int(kit or 0), []):
+            if kind == 12 and eid in edge and "colors" not in out:
+                g = edge[eid]
+                mult = float(g.get("GlowMultiplier") or 1.0)
+                c = [float(g.get(k) or 0) * mult for k in ("GlowRed", "GlowGreen", "GlowBlue")]
+                a = float(g.get("GlowAlpha") or 1.0)
+                out.update(colors=[c, c, c], alphas=[0.3 * a, a], power=max(0.1, float(g.get("FresnelCoefficient") or 1.0)),
+                           halo=[x * 0.5 for x in c], halo_width=6, halo_alpha=0.6 * a,
+                           fade=[float(g.get("FadeIn") or 0), float(g.get("FadeOut") or 0)])
+            elif kind == 7 and eid in shad and "colors" not in out:
+                g = shad[eid]
+                p, q = argb(g.get("PrimaryColor")), argb(g.get("SecondaryColor"))
+                inner, outer = float(g.get("InnerStrength") or 1.0), float(g.get("OuterStrength") or 1.0)
+                out.update(colors=[[x * 0.5 for x in q], q, p], alphas=[0.3 * inner, outer], power=1.0,
+                           halo=p, halo_width=7, halo_alpha=0.7 * outer,
+                           fade=[float(g.get("FadeInTime") or 0), float(g.get("FadeOutTime") or 0)])
+            elif kind == 16 and eid in grad and "colors" not in out:
+                g = grad[eid]
+                rgb = lambda k: [float(g.get(f"{k}_r") or 0), float(g.get(f"{k}_g") or 0), float(g.get(f"{k}_b") or 0)]
+                out.update(colors=[rgb("Colors0"), rgb("Colors1"), rgb("Colors2")],
+                           alphas=[0.0, float(g.get("Alpha2") or 0.8)], power=1.0, fade=[0.25, 0.5])
+                e = rgb("EdgeColor")
+                if any(e):
+                    out.update(halo=e, halo_width=2, halo_alpha=1.0)
+            elif kind == 9 and eid in outl and "halo" not in out:
+                c = hl.get(int(outl[eid].get("HighlightColorID") or 0)) or {}
+                out.update(halo=argb(c.get("StartColor") if c.get("StartColor") is not None else -1),
+                           halo_width=2, halo_alpha=1.0)
+                out.setdefault("fade", [0.25, 0.5])
+        if not out:
+            return None
+        out.setdefault("colors", [[0, 0, 0]] * 3)
+        out.setdefault("alphas", [0.0, 0.0])
+        out.setdefault("power", 1.0)
+        out.setdefault("halo", [0, 0, 0])
+        out.setdefault("halo_width", 0)
+        out.setdefault("halo_alpha", 0.0)
+        return out
 
     # -- the basket and the game -----------------------------------------------------------
     def basket(self) -> list:
@@ -800,7 +1187,7 @@ class Creatures:
                 continue
             seen.add(did)
             clean.append({k: e[k] for k in ("display", "name", "subname", "level", "faction", "rank", "scale",
-                                              "health", "damage", "type", "out") if k in e})
+                                              "health", "damage", "type", "out", "mount") if k in e})
         self._save("basket.json", clean)
         return clean
 
@@ -821,6 +1208,92 @@ class Creatures:
         j = self.job
         return {"state": j["state"], "steps": j["steps"], "result": j["result"], "log": j["log"][since:],
                 "at": len(j["log"])}
+
+    # CreatureSoundData columns that hold no SoundKit
+    _NOT_SOUNDS = {"ID", "NPCSoundID", "CreatureImpactType", "SoundFootstepID", "SoundInjuryCrushingBlowID",
+                   "FidgetDelaySecondsMin", "FidgetDelaySecondsMax", "CreatureSoundDataIDPet"}
+
+    def _sounds(self, src, client: str, displays: dict[int, int], di: D.DBCFile, files: dict) -> D.DBCFile | None:
+        """Retail's creature sounds (aggro, attack, wound, death, fidgets, greetings) for the new
+        displays: CreatureSoundData and NPCSounds rows made from retail's, column by column, each
+        SoundKit a SoundEntries row (sounds.SoundPort). The SoundEntries table, or None."""
+        from ..dbclayout import DbcLayout
+        from . import sounds as SND
+        dbd = getattr(self.wb.settings, "dbd", "") or ""
+        if not dbd or not os.path.isdir(dbd):
+            self._say("creature sounds need the WoWDBDefs folder (Settings)")
+            return None
+        rcdi = {i: dict(r) for i, r in src.table("CreatureDisplayInfo") if i in displays}
+        # a display without a sound set of its own plays its model's (CreatureModelData.SoundID)
+        bare = {int(r.get("ModelID") or 0) for r in rcdi.values() if not r.get("SoundID")}
+        if bare:
+            model_sound = {i: int(r.get("SoundID") or 0) for i, r in src.table("CreatureModelData") if i in bare}
+            for r in rcdi.values():
+                if not r.get("SoundID"):
+                    r["SoundID"] = model_sound.get(int(r.get("ModelID") or 0), 0)
+        want_csd = {int(r.get("SoundID") or 0) for r in rcdi.values()} - {0}
+        want_npc = {int(r.get("NPCSoundID") or 0) for r in rcdi.values()} - {0}
+        if not want_csd and not want_npc:
+            return None
+        rcsd = {i: r for i, r in src.table("CreatureSoundData") if i in want_csd}
+        rnpc = {i: r for i, r in src.table("NPCSounds") if i in want_npc} if want_npc else {}
+        cd = ClientData(client, top=PATCH_NAME)
+        cd.sources = [s for s in cd.sources
+                      if os.path.basename(s[1] if isinstance(s[1], str) else s[1].path).lower() != PATCH_NAME.lower()]
+        try:
+            entries = D.DBCFile.from_bytes(cd.read(SND.TABLE), "SoundEntries.dbc")
+            csd = D.DBCFile.from_bytes(cd.read("DBFilesClient\\CreatureSoundData.dbc"), "CreatureSoundData.dbc")
+            npc = D.DBCFile.from_bytes(cd.read("DBFilesClient\\NPCSounds.dbc"), "NPCSounds.dbc")
+            kit = self.wb.kit.cfg
+            listfile = find_listfile([self.wb.settings.listfile, os.path.join(getattr(kit, "work", "") or "", "listfile.csv")],
+                                     os.path.join(self.wb.settings.data_dir, "cache"), self._say)
+            sp = SND.SoundPort(src, listfile, entries, SND.CREATURE_RANGE, cd.exists)
+            L = DbcLayout("CreatureSoundData", dbd)
+            if L.field_count != csd.field_count:
+                raise CreatureError(f"CreatureSoundData.dbc has {csd.field_count} fields, WoWDBDefs says {L.field_count}")
+            made_csd, made_npc = {}, {}
+            for rid, r in rcsd.items():
+                row = L.blank()
+                nid = max(30000, csd.max_id() + 1)
+                row[0] = nid
+                for name, (start, width) in L.columns.items():
+                    if name == "ID":
+                        continue
+                    vals = r.get(name)
+                    vals = list(vals) if isinstance(vals, (list, tuple)) else [vals]
+                    for k in range(min(width, len(vals))):
+                        v = vals[k] or 0
+                        if name.startswith("FidgetDelay"):
+                            row[start + k] = D.float_to_u32(float(v))
+                        elif name == "CreatureImpactType":
+                            row[start + k] = int(v)
+                        elif name not in self._NOT_SOUNDS:
+                            row[start + k] = sp.kit(int(v))
+                csd.add_record(row)
+                made_csd[rid] = nid
+            for rid, r in rnpc.items():
+                kits = list(r.get("SoundID") or [])
+                nid = max(30000, npc.max_id() + 1)
+                npc.add_record([nid] + [sp.kit(int(x or 0)) for x in (kits + [0] * 4)[:4]])
+                made_npc[rid] = nid
+            for did, new_display in displays.items():
+                r = rcdi.get(did)
+                rec = di.find_by_id(new_display) if r else None
+                if rec is None:
+                    continue
+                rec[2] = made_csd.get(int(r.get("SoundID") or 0), 0)
+                rec[12] = made_npc.get(int(r.get("NPCSoundID") or 0), 0)    # 3.3.5: after SizeClass, BloodID
+            files.update(sp.files)
+            files[SND.TABLE] = entries.to_bytes()
+            files["DBFilesClient\\CreatureSoundData.dbc"] = csd.to_bytes()
+            files["DBFilesClient\\NPCSounds.dbc"] = npc.to_bytes()
+            self._say(f"sounds: {len(made_csd)} creature sound set(s), {len([x for x in sp.made.values() if x])} "
+                      f"sound kit(s), {len(sp.files)} file(s)")
+            for m in sp.missing[:5]:
+                self._say(f"  {m}")
+            return entries
+        finally:
+            cd.close()
 
     def _say(self, msg: str) -> None:
         self.job["log"].append(time.strftime("%H:%M:%S ") + msg)
@@ -977,7 +1450,7 @@ class Creatures:
 
         # the client holds the patch open and the worldserver reads its tables at start: close both
         # now, after the slow export, and start them when Install is done (_install_guarded)
-        if st["restart"]:
+        if st["restart"] and not getattr(self, "no_restart", False):      # the Mounts page closed them itself
             self._step("Close the client and worldserver", "running")
             self._restart = Restart(client, st["world_conf"], self._say)
             self._restart.stop()
@@ -991,6 +1464,15 @@ class Creatures:
             c = self._creature(did, wanted, rows[did])
             add_rows(md, di, ids[str(did)], ex, c)
             files.update(ex.files)
+        sound_table = None
+        try:
+            sound_table = self._sounds(src, client, {did: ids[str(did)]["display"] for did in exports}, di, files)
+        except Exception as e:
+            self._say(f"creature sounds left out: {type(e).__name__}: {e}")
+        try:
+            self._physics(src, exports, rows, files)
+        except Exception as e:
+            self._say(f"creature physics left out: {type(e).__name__}: {e}")
         files["DBFilesClient\\CreatureModelData.dbc"] = md.to_bytes()
         files["DBFilesClient\\CreatureDisplayInfo.dbc"] = di.to_bytes()
         patch = os.path.join(client, "Data", PATCH_NAME)
@@ -1008,6 +1490,14 @@ class Creatures:
                 raise CreatureError(f"{PATCH_NAME} is in use - close World of Warcraft and install again")
             size = os.path.getsize(patch)
             self._say(f"Data\\{PATCH_NAME}: {len(files)} files, {size / 1048576:.1f} MB")
+            if sound_table is not None:
+                # the spells' patch outranks ours and has a SoundEntries.dbc of its own: ours go in it too
+                from . import sounds as SND
+                from .spellport import PATCH_NAME as SPELL_PATCH
+                try:
+                    SND.merge_into(os.path.join(client, "Data", SPELL_PATCH), sound_table, SND.CREATURE_RANGE, self._say)
+                except PermissionError:
+                    self._say(f"{SPELL_PATCH} is in use: the creature sounds play after the next spell install")
         elif os.path.isfile(patch):
             os.remove(patch)
             self._say(f"Data\\{PATCH_NAME} removed: no creatures left")
@@ -1080,6 +1570,25 @@ class Creatures:
                   "done: restart the worldserver, start the client, and .npc add <entry> in game")
         return result
 
+    def _physics(self, src, exports: dict, rows: dict, files: dict) -> None:
+        """Retail physics (hair, cloth, tails, chains) for every creature whose model has a .phys:
+        DBFilesClient\\WXLCreaturePhysics.phy2, which Equip Plus runs live in the client."""
+        from . import physics as PH
+        models = []
+        for did, ex in exports.items():
+            phys = PH.phys_bytes(src.read(rows[did]["model"]), src.read)
+            if phys:
+                # every name the client may report: the file it loads, the DBC's .mdx, the bare name
+                models.append(([ex.model_path, ex.dbc_model_name, f"{ex.stem}.m2"], phys))
+        if not models:
+            return
+        table, notes = PH.table(self.wb.kit.cfg.tools, models)
+        for n in notes:
+            self._say(f"  {n}")
+        if table:
+            files[PH.CREATURE_TABLE] = table
+            self._say(f"physics for {len(models)} creature(s): moved live by Equip Plus (F9 to switch it)")
+
     def _creature(self, did: int, wanted: list, row: dict) -> dict:
         e = next((x for x in wanted if int(x["display"]) == did), {})
         scale = float(e.get("scale") or 1.0)
@@ -1089,7 +1598,7 @@ class Creatures:
                 "faction": e.get("faction", 14), "rank": e.get("rank", 0), "scale": scale,
                 "health": e.get("health", 1.0), "damage": e.get("damage", 1.0), "type": e.get("type", 10),
                 "geo": geo, "collision": row["collision"], "model_scale": row["model_scale"],
-                "display_scale": row["scale"], "alpha": row["alpha"],
+                "display_scale": row["scale"], "alpha": row["alpha"], "mount_height": row.get("mount_height") or 0.0,
                 "radius": span * row["scale"] * row["model_scale"] / 2, "reach": span * row["scale"] * row["model_scale"] / 2}
 
     def _server_bases(self, server_dbc: str) -> dict | None:
